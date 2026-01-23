@@ -45,7 +45,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             project: {
               type: "string",
-              description: "Optional: filter to a specific project path",
+              description: "Filter to a specific project path",
+            },
+            date_range: {
+              type: "string",
+              description: "Filter by time period: 'today', 'yesterday', 'last week', 'last month', or 'last N days' (e.g., 'last 3 days')",
+            },
+            sort_by: {
+              type: "string",
+              enum: ["relevance", "recency"],
+              description: "Sort order: 'relevance' (default, best semantic match first) or 'recency' (most recent first)",
             },
           },
           required: ["query"],
@@ -86,6 +95,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const query = args?.query as string;
       const limit = (args?.limit as number) || 5;
       const project = args?.project as string | undefined;
+      const dateRange = args?.date_range as string | undefined;
+      const sortBy = (args?.sort_by as "relevance" | "recency") || "relevance";
 
       if (!query) {
         return {
@@ -95,7 +106,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       try {
-        const results = await db.search(query, limit, project);
+        const results = await db.search(query, { limit, project, dateRange, sortBy });
 
         if (results.length === 0) {
           return {

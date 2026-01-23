@@ -29,6 +29,54 @@ interface SearchResult {
   score: number;
 }
 
+interface SearchOptions {
+  limit?: number;
+  project?: string;
+  dateRange?: string;
+  sortBy?: "relevance" | "recency";
+}
+
+function parseDateRange(dateRange: string): { start: Date; end: Date } | null {
+  const now = new Date();
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const endOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+
+  switch (dateRange.toLowerCase()) {
+    case "today":
+      return { start: startOfDay(now), end: endOfDay(now) };
+    case "yesterday": {
+      const yesterday = new Date(now);
+      yesterday.setDate(yesterday.getDate() - 1);
+      return { start: startOfDay(yesterday), end: endOfDay(yesterday) };
+    }
+    case "last_week":
+    case "last week":
+    case "week": {
+      const weekAgo = new Date(now);
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      return { start: startOfDay(weekAgo), end: endOfDay(now) };
+    }
+    case "last_month":
+    case "last month":
+    case "month": {
+      const monthAgo = new Date(now);
+      monthAgo.setMonth(monthAgo.getMonth() - 1);
+      return { start: startOfDay(monthAgo), end: endOfDay(now) };
+    }
+    default: {
+      // Try to parse as "last N days" pattern
+      const daysMatch = dateRange.match(/last\s*(\d+)\s*days?/i);
+      if (daysMatch) {
+        const days = parseInt(daysMatch[1], 10);
+        const daysAgo = new Date(now);
+        daysAgo.setDate(daysAgo.getDate() - days);
+        return { start: startOfDay(daysAgo), end: endOfDay(now) };
+      }
+      return null;
+    }
+  }
+}
+
 interface IndexStatus {
   totalChunks: number;
   projects: number;
@@ -230,20 +278,45 @@ export class ConversationDB {
     }
   }
 
-  async search(query: string, limit: number = 5, project?: string): Promise<SearchResult[]> {
+  async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
     if (!this.table) {
       return [];
     }
 
+    const { limit = 5, project, dateRange, sortBy = "relevance" } = options;
+
     const queryVector = await embedOne(query);
 
-    let searchQuery = this.table.vectorSearch(queryVector).limit(limit * 2); // Get extra for filtering
+    // Get more results for filtering
+    let searchQuery = this.table.vectorSearch(queryVector).limit(limit * 4);
 
     const results = await searchQuery.toArray();
 
     let filtered = results;
+
+    // Filter by project
     if (project) {
-      filtered = results.filter((r) => (r.project as string).includes(project));
+      filtered = filtered.filter((r) => (r.project as string).includes(project));
+    }
+
+    // Filter by date range
+    if (dateRange) {
+      const range = parseDateRange(dateRange);
+      if (range) {
+        filtered = filtered.filter((r) => {
+          const ts = new Date(r.timestamp as string);
+          return ts >= range.start && ts <= range.end;
+        });
+      }
+    }
+
+    // Sort by recency if requested
+    if (sortBy === "recency") {
+      filtered.sort((a, b) => {
+        const tsA = new Date(a.timestamp as string).getTime();
+        const tsB = new Date(b.timestamp as string).getTime();
+        return tsB - tsA; // Most recent first
+      });
     }
 
     return filtered.slice(0, limit).map((r) => ({
