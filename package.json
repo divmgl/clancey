@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server that indexes Claude Code conversations for semantic search",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,13 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["mcp", "claude", "conversation", "search", "lancedb"],
+  "keywords": [
+    "mcp",
+    "claude",
+    "conversation",
+    "search",
+    "lancedb"
+  ],
   "author": "Dexter Miguel",
   "license": "MIT",
   "dependencies": {
