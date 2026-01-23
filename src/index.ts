@@ -6,7 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { ConversationDB } from "./db.js";
 import { ConversationWatcher } from "./watcher.js";
-import { getClaudeDir } from "./parser.js";
+import { log, logError, LOG_FILE } from "./logger.js";
 import path from "path";
 import os from "os";
 
@@ -194,23 +194,27 @@ async function main() {
   // Initialize database
   await db.init();
 
+  // Connect to MCP transport FIRST (non-blocking)
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  log(`MCP server running. Logs: ${LOG_FILE}`);
+
   // Start file watcher for auto-indexing
   const watcher = new ConversationWatcher(db);
   watcher.start();
 
-  // Do initial index
-  console.error("[clancey] Starting initial index...");
-  const stats = await db.indexAll(false);
-  console.error(`[clancey] Indexed ${stats.added} chunks from ${stats.processed} conversations`);
-
-  // Connect to MCP transport
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  console.error("[clancey] MCP server running");
+  // Do initial index in background (don't block the server)
+  log("Starting background indexing...");
+  db.indexAll(false)
+    .then((stats) => {
+      log(`Background indexing complete: ${stats.added} chunks from ${stats.processed} conversations`);
+    })
+    .catch((error) => {
+      logError("Background indexing failed", error);
+    });
 }
 
 main().catch((error) => {
-  console.error("[clancey] Fatal error:", error);
+  logError("Fatal error", error);
   process.exit(1);
 });

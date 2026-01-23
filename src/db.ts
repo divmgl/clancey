@@ -6,6 +6,7 @@ import {
   chunkConversation,
   ConversationChunk,
 } from "./parser.js";
+import { log, logError } from "./logger.js";
 import fs from "fs";
 import path from "path";
 
@@ -69,7 +70,7 @@ export class ConversationDB {
       await this.loadIndexedFiles();
     }
 
-    console.error(`[clancey] Database initialized at ${this.dbPath}`);
+    log(`Database initialized at ${this.dbPath}`);
   }
 
   private async loadIndexedFiles(): Promise<void> {
@@ -112,8 +113,7 @@ export class ConversationDB {
     let processed = 0;
     let added = 0;
 
-    const allChunks: ConversationChunk[] = [];
-    const filesToIndex: string[] = [];
+    const filesToIndex: Array<{ filePath: string; mtime: number }> = [];
 
     for (const filePath of files) {
       const stat = await fs.promises.stat(filePath);
@@ -124,58 +124,67 @@ export class ConversationDB {
         continue;
       }
 
-      filesToIndex.push(filePath);
+      filesToIndex.push({ filePath, mtime: stat.mtimeMs });
     }
 
     if (filesToIndex.length === 0) {
+      log("No new conversations to index");
       return { processed: 0, added: 0 };
     }
 
-    console.error(`[clancey] Indexing ${filesToIndex.length} conversations...`);
+    log(`Indexing ${filesToIndex.length} conversations incrementally...`);
 
-    for (const filePath of filesToIndex) {
+    // Process one file at a time and save progress after each
+    for (let i = 0; i < filesToIndex.length; i++) {
+      const { filePath, mtime } = filesToIndex[i];
+
       try {
         const conversation = await parseConversation(filePath);
-        if (conversation) {
-          const chunks = chunkConversation(conversation);
-          allChunks.push(...chunks);
-          this.indexedFiles.set(filePath, conversation.lastModified);
+        if (!conversation) {
+          processed++;
+          continue;
         }
+
+        const chunks = chunkConversation(conversation);
+        if (chunks.length === 0) {
+          processed++;
+          continue;
+        }
+
+        log(`[${i + 1}/${filesToIndex.length}] Embedding ${chunks.length} chunks from ${path.basename(filePath)}...`);
+
+        // Generate embeddings for this file's chunks
+        const texts = chunks.map((c) => c.content);
+        const embeddings = await embed(texts);
+
+        const records: ChunkRecord[] = chunks.map((chunk, j) => ({
+          ...chunk,
+          vector: embeddings[j],
+        }));
+
+        // Save to database immediately
+        const tables = await this.db.tableNames();
+        if (tables.includes(TABLE_NAME)) {
+          // Delete existing chunks from this session before adding new ones
+          await this.table!.delete(`"sessionId" = '${conversation.sessionId}'`);
+          await this.table!.add(records);
+        } else {
+          this.table = await this.db.createTable(TABLE_NAME, records);
+        }
+
+        // Update metadata immediately so we can resume if interrupted
+        this.indexedFiles.set(filePath, mtime);
+        await this.saveIndexedFiles();
+
         processed++;
+        added += records.length;
+
+        log(`[${i + 1}/${filesToIndex.length}] Saved ${records.length} chunks`);
       } catch (error) {
-        console.error(`[clancey] Error parsing ${filePath}:`, error);
+        logError(`Error indexing ${filePath}`, error);
+        processed++;
       }
     }
-
-    if (allChunks.length > 0) {
-      // Generate embeddings in batches
-      console.error(`[clancey] Generating embeddings for ${allChunks.length} chunks...`);
-
-      const texts = allChunks.map((c) => c.content);
-      const embeddings = await embed(texts);
-
-      const records: ChunkRecord[] = allChunks.map((chunk, i) => ({
-        ...chunk,
-        vector: embeddings[i],
-      }));
-
-      // Create or add to table
-      const tables = await this.db.tableNames();
-      if (tables.includes(TABLE_NAME)) {
-        // Delete existing chunks from re-indexed files
-        const sessionIds = [...new Set(allChunks.map((c) => c.sessionId))];
-        for (const sessionId of sessionIds) {
-          await this.table!.delete(`sessionId = '${sessionId}'`);
-        }
-        await this.table!.add(records);
-      } else {
-        this.table = await this.db.createTable(TABLE_NAME, records);
-      }
-
-      added = records.length;
-    }
-
-    await this.saveIndexedFiles();
 
     return { processed, added };
   }
@@ -205,7 +214,7 @@ export class ConversationDB {
       const tables = await this.db.tableNames();
       if (tables.includes(TABLE_NAME)) {
         // Delete existing chunks from this session
-        await this.table!.delete(`sessionId = '${conversation.sessionId}'`);
+        await this.table!.delete(`"sessionId" = '${conversation.sessionId}'`);
         await this.table!.add(records);
       } else {
         this.table = await this.db.createTable(TABLE_NAME, records);
@@ -216,7 +225,7 @@ export class ConversationDB {
 
       return { processed: 1, added: records.length };
     } catch (error) {
-      console.error(`[clancey] Error indexing ${filePath}:`, error);
+      logError(`Error indexing ${filePath}`, error);
       return { processed: 1, added: 0 };
     }
   }

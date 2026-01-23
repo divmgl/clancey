@@ -1,6 +1,7 @@
 import chokidar, { type FSWatcher } from "chokidar";
 import { getProjectsDir } from "./parser.js";
 import { ConversationDB } from "./db.js";
+import { log, logError } from "./logger.js";
 import path from "path";
 
 export class ConversationWatcher {
@@ -15,7 +16,7 @@ export class ConversationWatcher {
   start(): void {
     const projectsDir = getProjectsDir();
 
-    console.error(`[clancey] Watching ${projectsDir} for changes...`);
+    log(`Watching ${projectsDir} for changes...`);
 
     this.watcher = chokidar.watch(projectsDir, {
       ignored: /(^|[\/\\])\../, // Ignore dotfiles
@@ -44,15 +45,15 @@ export class ConversationWatcher {
     const timer = setTimeout(async () => {
       this.debounceTimers.delete(filePath);
 
-      console.error(`[clancey] Re-indexing ${path.basename(filePath)}...`);
+      log(`Re-indexing ${path.basename(filePath)}...`);
 
       try {
         const stats = await this.db.indexFile(filePath);
         if (stats.added > 0) {
-          console.error(`[clancey] Added ${stats.added} chunks from ${path.basename(filePath)}`);
+          log(`Added ${stats.added} chunks from ${path.basename(filePath)}`);
         }
       } catch (error) {
-        console.error(`[clancey] Error indexing ${filePath}:`, error);
+        logError(`Error indexing ${filePath}`, error);
       }
     }, 3000); // Wait 3s after last change
 
