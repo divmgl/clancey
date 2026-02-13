@@ -12,6 +12,11 @@ An MCP server that indexes your Claude Code and Codex conversations for semantic
 
 ## Installation
 
+Use the setup for your client:
+
+<details>
+<summary>Claude Code</summary>
+
 Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 
 ```json
@@ -25,20 +30,24 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 }
 ```
 
-Restart Claude Code. That's it.
+Restart Claude Code.
 
-## Automated Releases
+</details>
 
-This repo is configured to auto-publish to npm on pushes to `main` when `package.json` version changes.
+<details>
+<summary>Codex</summary>
 
-Workflow:
-1. Bump `package.json` version (for example `0.3.0` -> `0.3.1`)
-2. Commit and push to `main`
-3. GitHub Actions runs typecheck + build
-4. If checks pass and version changed, it publishes to npm
+Add to your Codex config (`~/.codex/config.toml`):
 
-Required GitHub repository secret:
-- `NPM_TOKEN` (npm automation token with publish permission for the `clancey` package)
+```toml
+[mcp_servers.clancey]
+command = "npx"
+args = ["-y", "clancey"]
+```
+
+Restart Codex.
+
+</details>
 
 ## MCP Tools
 
@@ -66,11 +75,12 @@ Get statistics about indexed conversations.
 
 ## How It Works
 
-1. Watches `~/.claude/projects/` and `~/.codex/sessions/` for conversation files
-2. Parses JSONL conversation history
-3. Chunks conversations into searchable segments
-4. Generates embeddings using `all-MiniLM-L6-v2`
-5. Stores vectors in LanceDB for fast similarity search
+1. Scans conversation files from `~/.claude/projects/` and `~/.codex/sessions/`
+2. Parses JSONL events into user/assistant messages
+3. Chunks long conversations into searchable segments
+4. Generates embeddings with `all-MiniLM-L6-v2`
+5. Stores vectors in LanceDB at `~/.clancey/conversations.lance`
+6. Watches both source directories and incrementally re-indexes changed `.jsonl` files
 
 Data is stored in `~/.clancey/`. Logs are at `~/.clancey/clancey.log`.
 
