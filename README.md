@@ -1,5 +1,8 @@
 # Clancey
 
+[![CI](https://github.com/divmgl/clancey/actions/workflows/ci.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/ci.yml)
+[![Publish to npm](https://github.com/divmgl/clancey/actions/workflows/npm-publish.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/npm-publish.yml)
+
 An MCP server that indexes your Claude Code and Codex conversations for semantic search. Find solutions, decisions, and context from previous coding sessions.
 
 ## Features
