@@ -9,13 +9,24 @@ import { ConversationWatcher } from "./watcher.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import path from "path";
 import os from "os";
+import fs from "fs";
 
 const db = new ConversationDB(path.join(os.homedir(), ".clancey", "conversations.lance"));
+
+function getServerVersion(): string {
+  try {
+    const packageJsonPath = new URL("../package.json", import.meta.url);
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+    return packageJson.version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 const server = new Server(
   {
     name: "clancey",
-    version: "0.1.0",
+    version: getServerVersion(),
   },
   {
     capabilities: {
@@ -31,7 +42,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "search_conversations",
         description:
-          "Search past Claude Code conversations using semantic search. Returns relevant conversation excerpts that may contain solutions, decisions, or context from previous sessions.",
+          "Search past Claude Code and Codex conversations using semantic search. Returns relevant conversation excerpts that may contain solutions, decisions, or context from previous sessions.",
         inputSchema: {
           type: "object",
           properties: {
@@ -63,7 +74,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "index_conversations",
         description:
-          "Manually trigger indexing of Claude Code conversations. Usually not needed as indexing happens automatically.",
+          "Manually trigger indexing of Claude Code and Codex conversations. Usually not needed as indexing happens automatically.",
         inputSchema: {
           type: "object",
           properties: {

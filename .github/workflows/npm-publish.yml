@@ -1,0 +1,107 @@
+name: Publish to npm
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version_bumped: ${{ steps.version.outputs.bumped }}
+      new_version: ${{ steps.version.outputs.new_version }}
+      package_name: ${{ steps.version.outputs.package_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build
+        run: bun run build
+
+      - name: Detect version bump
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_name=$(node -p "require('./package.json').name")
+          new_version=$(node -p "require('./package.json').version")
+
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+          if git cat-file -e HEAD^:package.json 2>/dev/null; then
+            old_version=$(git show HEAD^:package.json | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.stdout.write(JSON.parse(d).version));')
+          else
+            old_version=""
+          fi
+
+          if [[ -n "$old_version" && "$old_version" != "$new_version" ]]; then
+            echo "Detected version bump: $old_version -> $new_version"
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No version bump detected; publish will be skipped."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: verify
+    if: needs.verify.outputs.version_bumped == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Ensure version is not already published
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "${{ needs.verify.outputs.package_name }}@${{ needs.verify.outputs.new_version }}" version >/dev/null 2>&1; then
+            echo "Version ${{ needs.verify.outputs.new_version }} is already published."
+            exit 1
+          fi
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

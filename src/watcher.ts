@@ -1,5 +1,5 @@
 import chokidar, { type FSWatcher } from "chokidar";
-import { getProjectsDir } from "./parser.js";
+import { getConversationWatchDirs } from "./parser.js";
 import { ConversationDB } from "./db.js";
 import { log, logError } from "./logger.js";
 import path from "path";
@@ -14,12 +14,19 @@ export class ConversationWatcher {
   }
 
   start(): void {
-    const projectsDir = getProjectsDir();
+    const watchDirs = getConversationWatchDirs();
+    if (watchDirs.length === 0) {
+      log("No conversation directories found to watch.");
+      return;
+    }
 
-    log(`Watching ${projectsDir} for changes...`);
+    log(`Watching ${watchDirs.join(", ")} for changes...`);
 
-    this.watcher = chokidar.watch(projectsDir, {
-      ignored: /(^|[\/\\])\../, // Ignore dotfiles
+    this.watcher = chokidar.watch(watchDirs, {
+      // Ignore hidden files by basename only. Using full-path dot matching would
+      // exclude everything under hidden roots like ~/.claude.
+      ignored: (watchedPath, stats) =>
+        !stats?.isDirectory() && path.basename(watchedPath).startsWith("."),
       persistent: true,
       ignoreInitial: true,
       awaitWriteFinish: {

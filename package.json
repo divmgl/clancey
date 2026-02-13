@@ -1,7 +1,7 @@
 {
   "name": "clancey",
-  "version": "0.2.0",
-  "description": "MCP server that indexes Claude Code conversations for semantic search",
+  "version": "0.3.0",
+  "description": "MCP server that indexes Claude Code and Codex conversations for semantic search",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -24,6 +24,7 @@
   "keywords": [
     "mcp",
     "claude",
+    "codex",
     "conversation",
     "search",
     "lancedb"

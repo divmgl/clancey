@@ -1,6 +1,6 @@
 # Clancey
 
-An MCP server that indexes your Claude Code conversations for semantic search. Find solutions, decisions, and context from previous coding sessions.
+An MCP server that indexes your Claude Code and Codex conversations for semantic search. Find solutions, decisions, and context from previous coding sessions.
 
 ## Features
 
@@ -26,6 +26,19 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 ```
 
 Restart Claude Code. That's it.
+
+## Automated Releases
+
+This repo is configured to auto-publish to npm on pushes to `main` when `package.json` version changes.
+
+Workflow:
+1. Bump `package.json` version (for example `0.3.0` -> `0.3.1`)
+2. Commit and push to `main`
+3. GitHub Actions runs typecheck + build
+4. If checks pass and version changed, it publishes to npm
+
+Required GitHub repository secret:
+- `NPM_TOKEN` (npm automation token with publish permission for the `clancey` package)
 
 ## MCP Tools
 
@@ -53,7 +66,7 @@ Get statistics about indexed conversations.
 
 ## How It Works
 
-1. Watches `~/.claude/projects/` for conversation files
+1. Watches `~/.claude/projects/` and `~/.codex/sessions/` for conversation files
 2. Parses JSONL conversation history
 3. Chunks conversations into searchable segments
 4. Generates embeddings using `all-MiniLM-L6-v2`
