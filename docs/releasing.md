@@ -6,7 +6,7 @@ This repository publishes to npm automatically with GitHub Actions.
 
 1. Bump `version` in `package.json`.
 2. Commit and push to `main`.
-3. Workflow `.github/workflows/npm-publish.yml` runs:
+3. Workflow `.github/workflows/publish.yml` runs:
    - `bun run typecheck`
    - `bun run build`
 4. If checks pass and the version changed, it publishes to npm.
