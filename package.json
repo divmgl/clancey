@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "MCP server that indexes Claude Code and Codex conversations for semantic search",
   "type": "module",
   "main": "dist/index.js",
