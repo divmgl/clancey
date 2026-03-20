@@ -23184,10 +23184,13 @@ var chokidar_default = { watch, FSWatcher };
 // src/watcher.ts
 import path3 from "path";
 import fs3 from "fs";
+var REINDEX_COOLDOWN_MS = 5 * 60 * 1e3;
 var ConversationWatcher = class {
   db;
   watcher = null;
   debounceTimers = /* @__PURE__ */ new Map();
+  lastIndexedAt = /* @__PURE__ */ new Map();
+  // filePath -> Date.now() of last index
   constructor(db2) {
     this.db = db2;
   }
@@ -23230,9 +23233,12 @@ var ConversationWatcher = class {
       } catch {
         return;
       }
+      const lastRun = this.lastIndexedAt.get(filePath);
+      if (lastRun !== void 0 && Date.now() - lastRun < REINDEX_COOLDOWN_MS) return;
       log(`Re-indexing ${path3.basename(filePath)}...`);
       try {
         const stats = await this.db.indexFile(filePath);
+        this.lastIndexedAt.set(filePath, Date.now());
         if (stats.added > 0) {
           log(`Added ${stats.added} chunks from ${path3.basename(filePath)}`);
         }
