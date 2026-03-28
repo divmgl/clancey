@@ -1,0 +1,8 @@
+{"type":"session_meta","payload":{"cwd":"/Users/dimiguel/dev/my-app"}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"How do I set up the database migration?"}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:01:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"You can use the migrate command to set up your database schema."}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:02:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for this project are..."}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:03:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>some env data</environment_context>"}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:04:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"short"}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:05:00Z","payload":{"type":"function_call","role":"assistant","content":"tool call, not a message"}}
+{"type":"response_item","timestamp":"2026-02-01T10:06:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Can you also add the seed data script?"}]}}

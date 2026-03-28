@@ -1,0 +1,10 @@
+{"isMeta":true,"title":"Test conversation"}
+{"type":"user","timestamp":"2026-01-01T10:00:00Z","message":{"content":"How do I fix the auth bug in the login flow?"}}
+{"type":"assistant","timestamp":"2026-01-01T10:01:00Z","message":{"content":"You need to check the session token validation. The issue is in the middleware."}}
+{"type":"summary","timestamp":"2026-01-01T10:02:00Z","message":{"content":"This should be ignored"}}
+{"type":"file-history-snapshot","timestamp":"2026-01-01T10:03:00Z","message":{"content":"Also ignored"}}
+{"type":"user","timestamp":"2026-01-01T10:04:00Z","message":{"content":"short"}}
+{"type":"user","timestamp":"2026-01-01T10:05:00Z","message":{"content":"<command-name>some-command</command-name>"}}
+{"type":"user","timestamp":"2026-01-01T10:06:00Z","message":{"content":"<local-command something"}}
+{"type":"user","timestamp":"2026-01-01T10:07:00Z","message":{"content":[{"type":"text","text":"Can you also look at the rate limiting logic?"}]}}
+{"type":"assistant","timestamp":"2026-01-01T10:08:00Z","message":{"content":[{"type":"text","text":"Sure, the rate limiter needs adjustment."},{"type":"tool_use","text":"should be ignored"}]}}

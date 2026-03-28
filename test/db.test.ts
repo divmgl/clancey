@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { buildMetadataFileDeleteFilter, buildSessionDeleteFilter, ConversationDB } from "../src/db.ts";
+import { buildMetadataFileDeleteFilter, buildSessionDeleteFilter, ConversationDB, parseDateRange } from "../src/db.ts";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -197,5 +197,80 @@ describe("saveIndexedFile", () => {
     expect(deleteMock).toHaveBeenCalledWith(`"filePath" = '/tmp/a''b.jsonl'`);
     expect(addMock).toHaveBeenCalledTimes(1);
     expect(addMock).toHaveBeenCalledWith([{ filePath: "/tmp/a'b.jsonl", lastModified: 123 }]);
+  });
+});
+
+describe("parseDateRange", () => {
+  test("parses 'today' to start and end of current day", () => {
+    const result = parseDateRange("today");
+    expect(result).not.toBeNull();
+    const now = new Date();
+    expect(result!.start.getFullYear()).toBe(now.getFullYear());
+    expect(result!.start.getMonth()).toBe(now.getMonth());
+    expect(result!.start.getDate()).toBe(now.getDate());
+    expect(result!.start.getHours()).toBe(0);
+    expect(result!.end.getHours()).toBe(23);
+    expect(result!.end.getMinutes()).toBe(59);
+  });
+
+  test("parses 'yesterday'", () => {
+    const result = parseDateRange("yesterday");
+    expect(result).not.toBeNull();
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    expect(result!.start.getDate()).toBe(yesterday.getDate());
+    expect(result!.end.getDate()).toBe(yesterday.getDate());
+  });
+
+  test("parses 'last_week', 'last week', and 'week'", () => {
+    for (const input of ["last_week", "last week", "week"]) {
+      const result = parseDateRange(input);
+      expect(result).not.toBeNull();
+      const diff = result!.end.getTime() - result!.start.getTime();
+      const days = diff / (1000 * 60 * 60 * 24);
+      expect(days).toBeGreaterThanOrEqual(6);
+      expect(days).toBeLessThanOrEqual(8);
+    }
+  });
+
+  test("parses 'last_month', 'last month', and 'month'", () => {
+    for (const input of ["last_month", "last month", "month"]) {
+      const result = parseDateRange(input);
+      expect(result).not.toBeNull();
+      const diff = result!.end.getTime() - result!.start.getTime();
+      const days = diff / (1000 * 60 * 60 * 24);
+      expect(days).toBeGreaterThanOrEqual(27);
+      expect(days).toBeLessThanOrEqual(32);
+    }
+  });
+
+  test("parses 'last N days' pattern", () => {
+    const result = parseDateRange("last 3 days");
+    expect(result).not.toBeNull();
+    const diff = result!.end.getTime() - result!.start.getTime();
+    const days = diff / (1000 * 60 * 60 * 24);
+    expect(days).toBeGreaterThanOrEqual(2);
+    expect(days).toBeLessThanOrEqual(4);
+  });
+
+  test("parses 'last 30 days'", () => {
+    const result = parseDateRange("last 30 days");
+    expect(result).not.toBeNull();
+    const diff = result!.end.getTime() - result!.start.getTime();
+    const days = diff / (1000 * 60 * 60 * 24);
+    expect(days).toBeGreaterThanOrEqual(29);
+    expect(days).toBeLessThanOrEqual(31);
+  });
+
+  test("is case insensitive", () => {
+    expect(parseDateRange("TODAY")).not.toBeNull();
+    expect(parseDateRange("Yesterday")).not.toBeNull();
+    expect(parseDateRange("LAST WEEK")).not.toBeNull();
+  });
+
+  test("returns null for unrecognized input", () => {
+    expect(parseDateRange("gibberish")).toBeNull();
+    expect(parseDateRange("next week")).toBeNull();
+    expect(parseDateRange("")).toBeNull();
   });
 });

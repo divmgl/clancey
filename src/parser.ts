@@ -52,13 +52,13 @@ function isCodexConversationFile(filePath: string): boolean {
   return normalized.startsWith(`${codexSessionsDir}${path.sep}`);
 }
 
-function decodeClaudeProject(projectDir: string): string {
+export function decodeClaudeProject(projectDir: string): string {
   return projectDir.startsWith("-")
     ? "/" + projectDir.slice(1).replace(/-/g, "/")
     : projectDir;
 }
 
-function extractTextContent(content: unknown): string {
+export function extractTextContent(content: unknown): string {
   if (typeof content === "string") {
     return content.trim();
   }
@@ -233,7 +233,7 @@ async function parseClaudeConversation(filePath: string, stat: fs.Stats): Promis
   };
 }
 
-async function parseCodexConversation(filePath: string, stat: fs.Stats): Promise<Conversation | null> {
+export async function parseCodexConversation(filePath: string, stat: fs.Stats): Promise<Conversation | null> {
   const sessionId = path.basename(filePath, ".jsonl");
   const messages: Message[] = [];
   let project = "codex";
