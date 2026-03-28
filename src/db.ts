@@ -96,6 +96,9 @@ export class ConversationDB {
   private db: lancedb.Connection | null = null;
   private table: lancedb.Table | null = null;
   private indexedFiles: Map<string, number> = new Map(); // filePath -> lastModified
+  private indexingInProgress: Set<string> = new Set(); // files currently being indexed
+  private writesSinceCompaction: number = 0;
+  private readonly COMPACT_EVERY_N_WRITES = 50;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -152,6 +155,36 @@ export class ConversationDB {
     } else if (records.length > 0) {
       await this.db.createTable(METADATA_TABLE, records);
     }
+
+    this.writesSinceCompaction++;
+    if (this.writesSinceCompaction >= this.COMPACT_EVERY_N_WRITES) {
+      await this.maybeCompact();
+    }
+  }
+
+  private async maybeCompact(): Promise<void> {
+    if (!this.db) return;
+
+    try {
+      log("Running LanceDB compaction...");
+      const tables = await this.db.tableNames();
+      for (const tableName of tables) {
+        const table = await this.db.openTable(tableName);
+        await table.optimize({ cleanupOlderThan: new Date(Date.now() - 60_000) });
+      }
+      this.writesSinceCompaction = 0;
+      log("Compaction complete");
+    } catch (error) {
+      logError("Compaction failed (non-fatal)", error);
+    }
+  }
+
+  isIndexing(filePath: string): boolean {
+    return this.indexingInProgress.has(filePath);
+  }
+
+  getLastIndexedMtime(filePath: string): number | undefined {
+    return this.indexedFiles.get(filePath);
   }
 
   async indexAll(force: boolean = false): Promise<IndexStats> {
@@ -184,17 +217,32 @@ export class ConversationDB {
 
     // Process one file at a time and save progress after each
     for (let i = 0; i < filesToIndex.length; i++) {
-      const { filePath, mtime } = filesToIndex[i];
+      const { filePath } = filesToIndex[i];
+
+      // Skip if already being indexed by the watcher
+      if (this.indexingInProgress.has(filePath)) {
+        log(`[${i + 1}/${filesToIndex.length}] Skipping ${path.basename(filePath)} (already being indexed)`);
+        processed++;
+        continue;
+      }
+
+      this.indexingInProgress.add(filePath);
 
       try {
         const conversation = await parseConversation(filePath);
         if (!conversation) {
+          // Save mtime so we don't reprocess this file every startup
+          const postStat = await fs.promises.stat(filePath);
+          this.indexedFiles.set(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
 
         const chunks = chunkConversation(conversation);
         if (chunks.length === 0) {
+          // Save mtime so we don't reprocess this file every startup
+          const postStat = await fs.promises.stat(filePath);
+          this.indexedFiles.set(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
@@ -220,8 +268,10 @@ export class ConversationDB {
           this.table = await this.db.createTable(TABLE_NAME, records);
         }
 
-        // Update metadata immediately so we can resume if interrupted
-        this.indexedFiles.set(filePath, mtime);
+        // Save the CURRENT mtime (not the pre-parse one) to avoid re-indexing
+        // if the file was modified during embedding
+        const postStat = await fs.promises.stat(filePath);
+        this.indexedFiles.set(filePath, postStat.mtimeMs);
         await this.saveIndexedFiles();
 
         processed++;
@@ -231,8 +281,16 @@ export class ConversationDB {
       } catch (error) {
         logError(`Error indexing ${filePath}`, error);
         processed++;
+      } finally {
+        this.indexingInProgress.delete(filePath);
       }
     }
+
+    // Save metadata for any empty/null files that were skipped
+    await this.saveIndexedFiles();
+
+    // Compact after bulk indexing
+    await this.maybeCompact();
 
     return { processed, added };
   }
@@ -240,14 +298,39 @@ export class ConversationDB {
   async indexFile(filePath: string): Promise<IndexStats> {
     if (!this.db) throw new Error("Database not initialized");
 
+    // Skip if this file is already being indexed (by indexAll or a prior watcher call)
+    if (this.indexingInProgress.has(filePath)) {
+      log(`Skipping ${path.basename(filePath)} (already being indexed)`);
+      return { processed: 0, added: 0 };
+    }
+
+    // Skip if file hasn't changed since last index
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const lastIndexed = this.indexedFiles.get(filePath);
+      if (lastIndexed !== undefined && lastIndexed >= stat.mtimeMs) {
+        return { processed: 0, added: 0 };
+      }
+    } catch {
+      return { processed: 0, added: 0 };
+    }
+
+    this.indexingInProgress.add(filePath);
+
     try {
       const conversation = await parseConversation(filePath);
       if (!conversation) {
+        // Save mtime so watcher doesn't retry this file
+        const postStat = await fs.promises.stat(filePath);
+        this.indexedFiles.set(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 
       const chunks = chunkConversation(conversation);
       if (chunks.length === 0) {
+        // Save mtime so watcher doesn't retry this file
+        const postStat = await fs.promises.stat(filePath);
+        this.indexedFiles.set(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 
@@ -268,13 +351,17 @@ export class ConversationDB {
         this.table = await this.db.createTable(TABLE_NAME, records);
       }
 
-      this.indexedFiles.set(filePath, conversation.lastModified);
+      // Save the CURRENT mtime to avoid re-indexing if file was modified during embedding
+      const postStat = await fs.promises.stat(filePath);
+      this.indexedFiles.set(filePath, postStat.mtimeMs);
       await this.saveIndexedFiles();
 
       return { processed: 1, added: records.length };
     } catch (error) {
       logError(`Error indexing ${filePath}`, error);
       return { processed: 1, added: 0 };
+    } finally {
+      this.indexingInProgress.delete(filePath);
     }
   }
 

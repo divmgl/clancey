@@ -3,11 +3,16 @@ import { getConversationWatchDirs } from "./parser.js";
 import { ConversationDB } from "./db.js";
 import { log, logError } from "./logger.js";
 import path from "path";
+import fs from "fs";
+
+// Don't re-index the same file more than once per 5 minutes
+const REINDEX_COOLDOWN_MS = 5 * 60 * 1000;
 
 export class ConversationWatcher {
   private db: ConversationDB;
   private watcher: FSWatcher | null = null;
   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private lastIndexedAt: Map<string, number> = new Map(); // filePath -> Date.now() of last index
 
   constructor(db: ConversationDB) {
     this.db = db;
@@ -43,6 +48,9 @@ export class ConversationWatcher {
     // Only care about .jsonl files
     if (!filePath.endsWith(".jsonl")) return;
 
+    // Skip if already being indexed
+    if (this.db.isIndexing(filePath)) return;
+
     // Debounce: wait for writes to settle
     const existing = this.debounceTimers.get(filePath);
     if (existing) {
@@ -52,10 +60,27 @@ export class ConversationWatcher {
     const timer = setTimeout(async () => {
       this.debounceTimers.delete(filePath);
 
+      // Re-check after debounce - may have been picked up by indexAll
+      if (this.db.isIndexing(filePath)) return;
+
+      // Check mtime — skip if file hasn't changed since last index
+      try {
+        const stat = await fs.promises.stat(filePath);
+        const lastIndexed = this.db.getLastIndexedMtime(filePath);
+        if (lastIndexed !== undefined && lastIndexed >= stat.mtimeMs) return;
+      } catch {
+        return; // File may have been deleted
+      }
+
+      // Cooldown — don't re-index the same file more than once per 5 minutes
+      const lastRun = this.lastIndexedAt.get(filePath);
+      if (lastRun !== undefined && Date.now() - lastRun < REINDEX_COOLDOWN_MS) return;
+
       log(`Re-indexing ${path.basename(filePath)}...`);
 
       try {
         const stats = await this.db.indexFile(filePath);
+        this.lastIndexedAt.set(filePath, Date.now());
         if (stats.added > 0) {
           log(`Added ${stats.added} chunks from ${path.basename(filePath)}`);
         }

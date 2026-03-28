@@ -6,6 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { ConversationDB } from "./db.js";
 import { ConversationWatcher } from "./watcher.js";
+import { tryAcquireIndexerLock } from "./lock.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import path from "path";
 import os from "os";
@@ -221,19 +222,30 @@ async function main() {
   await server.connect(transport);
   log(`MCP server running. Logs: ${LOG_FILE}`);
 
-  // Start file watcher for auto-indexing
-  const watcher = new ConversationWatcher(db);
-  watcher.start();
+  // Only one instance should do indexing and file watching.
+  // Other instances are search-only (they read from the shared LanceDB on disk).
+  const isIndexer = tryAcquireIndexerLock();
 
-  // Do initial index in background (don't block the server)
-  log("Starting background indexing...");
-  db.indexAll(false)
-    .then((stats) => {
-      log(`Background indexing complete: ${stats.added} chunks from ${stats.processed} conversations`);
-    })
-    .catch((error) => {
-      logError("Background indexing failed", error);
-    });
+  if (isIndexer) {
+    // Do initial index in background (don't block the server)
+    // Start the watcher AFTER initial indexing to avoid races
+    const watcher = new ConversationWatcher(db);
+
+    log("Starting background indexing...");
+    db.indexAll(false)
+      .then((stats) => {
+        log(`Background indexing complete: ${stats.added} chunks from ${stats.processed} conversations`);
+        // Now start the watcher for incremental updates
+        watcher.start();
+      })
+      .catch((error) => {
+        logError("Background indexing failed", error);
+        // Start watcher anyway so new conversations get indexed
+        watcher.start();
+      });
+  } else {
+    log("Running in search-only mode (another instance is handling indexing).");
+  }
 }
 
 main().catch((error) => {

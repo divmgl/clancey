@@ -15,6 +15,7 @@
     "url": "git+https://github.com/divmgl/clancey.git"
   },
   "scripts": {
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@lancedb/lancedb --external:@huggingface/transformers --external:onnxruntime-node --banner:js=\"#!/usr/bin/env node\"",
     "dev": "bun run build --watch",
