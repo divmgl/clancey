@@ -414,7 +414,9 @@ export class ConversationDB {
 
     const queryVector = await embedOne(query);
 
-    let searchQuery = table.vectorSearch(queryVector).limit(limit);
+    // When sorting by recency, fetch more candidates so we have a meaningful pool to sort
+    const fetchLimit = sortBy === "recency" ? Math.max(limit * 10, 50) : limit;
+    let searchQuery = table.vectorSearch(queryVector).limit(fetchLimit);
 
     // Build WHERE clause for pre-filtering
     const filters: string[] = [];
