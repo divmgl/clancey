@@ -465,6 +465,7 @@ export class ConversationDB {
         totalChunks: 0,
         projects: 0,
         lastUpdated: null,
+        isIndexing: this.indexAllInProgress,
       };
     }
 
