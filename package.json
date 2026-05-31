@@ -47,6 +47,7 @@
     "typescript": "^6.0.3"
   },
   "trustedDependencies": [
+    "better-sqlite3",
     "onnxruntime-node",
     "protobufjs"
   ]
