@@ -30,6 +30,8 @@ You never call Clancey directly. Claude does, whenever you ask it about past wor
 
 As you work, Claude records the decisions it makes and the incidental things it learns about your system — gotchas, constraints, how a subsystem actually behaves — so both are searchable later, and it can revise or drop any of them when one was wrong or duplicated. You can also ask it to go back through your older sessions and fill in the decisions it finds, so even history from before you installed Clancey becomes useful.
 
+Recall is semantic, so it finds things by meaning even when you don't remember the exact words. When something was only ever said in passing — never recorded as a decision — Claude falls back to a plain keyword search over the verbatim conversation, so an offhand remark is still findable by the words you used.
+
 Codex works too, with one difference: Clancey imports your Codex history and answers from inside Codex, but it only records live as you work in Claude Code.
 
 ## Keep your history

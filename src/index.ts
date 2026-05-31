@@ -14,10 +14,12 @@ import {
   noteEmbedInput,
   recall,
   search,
+  grepTurns,
   getTurns,
   storeTotals,
   WorkItem,
   SearchHit,
+  TurnHit,
 } from "./store.js";
 import { resolveSession, parseAny } from "./parser.js";
 import { embedOne } from "./embeddings.js";
@@ -62,6 +64,21 @@ function formatWorkItems(items: WorkItem[]): string {
       }
       return lines.join("\n");
     })
+    .join("\n\n");
+}
+
+/** Below this top cosine score, `search` nudges the agent toward the keyword fallback. */
+const LOW_CONFIDENCE = 0.45;
+
+function formatTurnHits(hits: TurnHit[]): string {
+  if (hits.length === 0) {
+    return "No matching turns. (Only backfilled sessions are indexed — run `clancey backfill` if a recent session is missing.)";
+  }
+  return hits
+    .map(
+      (h, i) =>
+        `${i + 1}. (${h.branch ?? "?"}) session=${h.session} · ${h.ts}\n   ${h.snippet.replace(/\s+/g, " ").trim()}`,
+    )
     .join("\n\n");
 }
 
@@ -182,11 +199,24 @@ function buildServer(db: Store): Server {
       {
         name: "search",
         description:
-          "Semantic search over recorded decisions, learnings, and session framings, ranked by similarity (descending). Use for the open case: 'what did I decide about X' or 'what did I learn about X' when you don't know the branch.",
+          "Semantic search over recorded decisions, learnings, and session framings, ranked by similarity (descending). Use for the open case: 'what did I decide about X' or 'what did I learn about X' when you don't know the branch. Only covers what was recorded or framed — if it misses, fall back to grep_turns for literal keyword search over the raw conversation.",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "Natural-language query" },
+            limit: { type: "number", description: "Max results (default: 8)" },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "grep_turns",
+        description:
+          "Keyword/full-text search over the verbatim conversation turns — the fallback when `search` (semantic) misses something said in passing that was never recorded as a decision or learning. Matches any of the query words, best matches first, so a turn hitting most of them still surfaces. Returns matching snippets with their session, so you can then read_turns that session for full context.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Keywords to match (turns matching any word surface, ranked by relevance)" },
             limit: { type: "number", description: "Max results (default: 8)" },
           },
           required: ["query"],
@@ -290,7 +320,18 @@ function buildServer(db: Store): Server {
           const query = args.query as string;
           if (!query) return { ...text("Error: query is required"), isError: true };
           const vector = await embedOne(query);
-          return text(formatSearchHits(search(db, vector, (args.limit as number) ?? 8)));
+          const hits = search(db, vector, (args.limit as number) ?? 8);
+          let out = formatSearchHits(hits);
+          const top = hits[0]?.score ?? 0;
+          if (top < LOW_CONFIDENCE) {
+            out += `\n\n(low confidence — top score ${top.toFixed(3)}. For literal wording, try grep_turns({ query }) — keyword search over the raw conversation.)`;
+          }
+          return text(out);
+        }
+        case "grep_turns": {
+          const query = args.query as string;
+          if (!query) return { ...text("Error: query is required"), isError: true };
+          return text(formatTurnHits(grepTurns(db, query, (args.limit as number) ?? 8)));
         }
         case "read_turns": {
           const session = args.session as string;

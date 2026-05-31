@@ -2,6 +2,14 @@
 
 A memory for AI coding sessions. An MCP server (plus a thin operational CLI) that records what Claude Code / Codex sessions did and the decisions made, so the agent can map a branch or file back to the conversation that produced it.
 
+## Workflow — commit straight to `main`
+
+This is a solo, one-person project. There is no PR review, no Graphite, no `dexter/` branch
+convention here — those are other-repo habits that do **not** apply. Just commit your work
+directly to `main`. Do not create a feature branch "to be safe": committing code to `main` is
+safe because publishing is gated on a `version` bump, not on code (see Releasing below). The only
+thing you must never do on your own is bump `version`.
+
 ## Releasing — manual only, never aggressive
 
 **Do NOT push a version bump to `main` on your own.** A push to `main` that changes

@@ -12,6 +12,7 @@ import {
   insertEmbedding,
   recall,
   search,
+  grepTurns,
   getNudgeState,
   setNudgeState,
   insertTurn,
@@ -157,6 +158,60 @@ describe("turns", () => {
   });
 });
 
+describe("grepTurns", () => {
+  test("finds a turn by keyword that semantic search would miss", () => {
+    insertTurn(db, {
+      session: "s1",
+      ts: "t1",
+      branch: "feature/x",
+      text: "the effort label should be ez, normal, or heroic",
+    });
+    insertTurn(db, { session: "s2", ts: "t2", branch: "feature/y", text: "unrelated chatter about icons" });
+    const hits = grepTurns(db, "effort label");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].session, "s1");
+    assert.equal(hits[0].branch, "feature/x");
+    assert.match(hits[0].snippet, /effort/);
+  });
+
+  test("matches any term and ranks turns hitting more of them first (OR semantics)", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "effort and difficulty together" });
+    insertTurn(db, { session: "s2", ts: "t2", branch: null, text: "effort alone" });
+    insertTurn(db, { session: "s3", ts: "t3", branch: null, text: "nothing relevant here" });
+    // Both s1 and s2 surface (a missing word doesn't wipe results); s1 ranks first.
+    assert.deepEqual(
+      grepTurns(db, "effort difficulty").map((h) => h.session),
+      ["s1", "s2"],
+    );
+  });
+
+  test("sanitizes punctuation and FTS operators instead of throwing", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "the build broke on CI again" });
+    assert.doesNotThrow(() => grepTurns(db, 'build AND "CI" OR (broke)*'));
+    assert.deepEqual(
+      grepTurns(db, "build CI broke").map((h) => h.session),
+      ["s1"],
+    );
+  });
+
+  test("returns nothing for a query with no searchable tokens", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "anything" });
+    assert.deepEqual(grepTurns(db, "  -- !! "), []);
+  });
+
+  test("deleteSession removes turns from the full-text index", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "ephemeral note" });
+    deleteSession(db, "s1");
+    assert.deepEqual(grepTurns(db, "ephemeral"), []);
+  });
+
+  test("respects the limit", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "shared keyword one" });
+    insertTurn(db, { session: "s2", ts: "t2", branch: null, text: "shared keyword two" });
+    assert.equal(grepTurns(db, "shared keyword", 1).length, 1);
+  });
+});
+
 describe("nudge state", () => {
   test("upserts last branch and nudge timestamp", () => {
     assert.equal(getNudgeState(db, "s1"), undefined);
@@ -184,6 +239,25 @@ describe("schema migration", () => {
         event_id: number | null;
       };
       assert.deepEqual(row, { text: "legacy", event_id: null });
+    } finally {
+      migrated.close();
+      for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
+    }
+  });
+
+  test("indexes pre-existing turns into turns_fts when the FTS table is first created", () => {
+    const p = path.join(os.tmpdir(), `clancey-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = new Database(p);
+    old.exec(`CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL, branch TEXT, text TEXT NOT NULL)`);
+    old.prepare(`INSERT INTO turns (session, ts, branch, text) VALUES ('s1', 't1', 'b', 'historical effort note')`).run();
+    old.close();
+
+    const migrated = openStore(p);
+    try {
+      assert.deepEqual(
+        grepTurns(migrated, "historical effort").map((h) => h.session),
+        ["s1"],
+      );
     } finally {
       migrated.close();
       for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });

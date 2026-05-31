@@ -140,6 +140,16 @@ function migrate(db: Store): void {
     );
     CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session);
 
+    -- Full-text index over verbatim turns: the keyword fallback for when semantic
+    -- search misses something said in passing. Metadata columns are UNINDEXED so
+    -- they ride along for results without being part of the match.
+    CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+      text,
+      session UNINDEXED,
+      ts      UNINDEXED,
+      branch  UNINDEXED
+    );
+
     CREATE TABLE IF NOT EXISTS state (
       session       TEXT PRIMARY KEY,
       last_branch   TEXT,
@@ -158,6 +168,19 @@ function migrate(db: Store): void {
   `);
 
   addColumnIfMissing(db, "embeddings", "event_id", "INTEGER");
+  backfillTurnsFts(db);
+}
+
+/** Populate turns_fts from turns when the FTS table is new but turns already has rows. */
+function backfillTurnsFts(db: Store): void {
+  const fts = (db.prepare(`SELECT count(*) c FROM turns_fts`).get() as { c: number }).c;
+  if (fts > 0) return;
+  const turns = (db.prepare(`SELECT count(*) c FROM turns`).get() as { c: number }).c;
+  if (turns === 0) return;
+  db.exec(
+    `INSERT INTO turns_fts (rowid, text, session, ts, branch)
+     SELECT id, text, session, ts, branch FROM turns`,
+  );
 }
 
 /** Additive schema upgrade for dbs created before a column existed. */
@@ -283,9 +306,14 @@ export function deleteNote(db: Store, id: number): boolean {
   return true;
 }
 
-/** Snapshot a human turn so read_turns survives transcript pruning. */
+/** Snapshot a human turn so read_turns survives transcript pruning, and index it for grep_turns. */
 export function insertTurn(db: Store, t: TurnInput): void {
-  db.prepare(`INSERT INTO turns (session, ts, branch, text) VALUES (@session, @ts, @branch, @text)`).run(t);
+  const info = db
+    .prepare(`INSERT INTO turns (session, ts, branch, text) VALUES (@session, @ts, @branch, @text)`)
+    .run(t);
+  db.prepare(
+    `INSERT INTO turns_fts (rowid, text, session, ts, branch) VALUES (@rowid, @text, @session, @ts, @branch)`,
+  ).run({ rowid: Number(info.lastInsertRowid), text: t.text, session: t.session, ts: t.ts, branch: t.branch });
 }
 
 export function getTurns(db: Store, session: string, branch?: string): StoredTurn[] {
@@ -383,6 +411,39 @@ export function recall(
   });
 }
 
+export interface TurnHit {
+  session: string;
+  branch: string | null;
+  ts: string;
+  snippet: string;
+}
+
+/**
+ * Turn a free-text query into a safe FTS5 MATCH expression: extract word tokens,
+ * quote each (so punctuation and FTS operators can't break the syntax), and OR them.
+ * OR (not AND) keeps this a forgiving fallback — a turn matching most of the words
+ * still surfaces, ranked above weaker matches by BM25, instead of one absent word
+ * wiping out every result. Returns null when the query has no searchable tokens.
+ */
+function ftsQuery(raw: string): string | null {
+  const terms = raw.match(/[\p{L}\p{N}]+/gu);
+  if (!terms || terms.length === 0) return null;
+  return terms.map((t) => `"${t}"`).join(" OR ");
+}
+
+/** Keyword/full-text search over verbatim turns — the fallback when `search` misses. */
+export function grepTurns(db: Store, query: string, limit = 8): TurnHit[] {
+  const match = ftsQuery(query);
+  if (!match) return [];
+  return db
+    .prepare(
+      `SELECT session, branch, ts, snippet(turns_fts, 0, '«', '»', '…', 16) AS snippet
+       FROM turns_fts WHERE turns_fts MATCH @match
+       ORDER BY rank LIMIT @limit`,
+    )
+    .all({ match, limit }) as TurnHit[];
+}
+
 export function search(db: Store, queryVector: number[], limit = 8): SearchHit[] {
   const rows = db
     .prepare(`SELECT session, repo, branch, kind, text, vector FROM embeddings`)
@@ -460,4 +521,5 @@ export function deleteSession(db: Store, session: string): void {
   db.prepare(`DELETE FROM events WHERE session = ? AND type = 'tool'`).run(session);
   db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
   db.prepare(`DELETE FROM turns WHERE session = ?`).run(session);
+  db.prepare(`DELETE FROM turns_fts WHERE session = ?`).run(session);
 }
