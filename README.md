@@ -32,8 +32,6 @@ As you work, Claude records the decisions it makes so they're searchable later. 
 
 Codex works too, with one difference: Clancey imports your Codex history and answers from inside Codex, but it only records live as you work in Claude Code.
 
-> Tip: when asking about a PR, point Claude at a changed file rather than the branch name. Branch names drift (worktrees, renames, stacked PRs); the files you touched are the reliable trail.
-
 ## Keep your history
 
 Claude Code deletes chat transcripts after 30 days by default. Once a conversation is pruned, its original turns are gone for good. Clancey's own record of your work and decisions survives, but to keep the conversations themselves readable, raise the limit in `~/.claude/settings.json`:
