@@ -45,14 +45,14 @@ Codex works too, with one difference: Clancey imports your Codex history and ans
 
 ## Commands
 
-You only ever run `setup` by hand; Claude Code runs everything else for you.
+You only ever run `setup` by hand; Claude Code runs everything else for you. Setup pins the hooks and MCP server to the version that installed them, so a later release won't change your setup until you re-run it.
 
 ```
-clancey setup       Set up Clancey in Claude Code and import history (run once)
-clancey backfill    Re-import existing conversations
+npx clancey setup       Set up Clancey in Claude Code and import history (run once)
+npx clancey backfill    Re-import existing conversations
 ```
 
-Run `clancey --help` for the full list. Everything Clancey stores lives in `~/.clancey/`.
+Run `npx clancey --help` for the full list. Everything Clancey stores lives in `~/.clancey/`.
 
 ## Development
 

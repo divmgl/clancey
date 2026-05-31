@@ -113,8 +113,22 @@ export async function backfill(
   return { sessions, events, embeddings };
 }
 
-/** Add the clancey hooks to the global Claude Code settings, idempotently. */
-function wireHooks(): string {
+/**
+ * The pinned package spec (`clancey@<version>`) that all wiring runs through `npx`.
+ * Pinning means a user's hooks and MCP keep working on the version that set them up,
+ * even after newer releases ship; re-running setup re-pins to the current version.
+ */
+function clanceySpec(): string {
+  const version = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version as string;
+  return `clancey@${version}`;
+}
+
+/** A hook command that invokes clancey (any pinned version, or the legacy bare form). */
+const CLANCEY_HOOK_RE = /\bclancey(@\S+)?\s+hook\b/;
+
+/** Add (or re-pin) the clancey hooks in the global Claude Code settings, idempotently. */
+function wireHooks(spec: string): string {
+  const hookCmd = `npx -y ${spec} hook`;
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
   let settings: { hooks?: Record<string, HookGroup[]> } = {};
   if (fs.existsSync(settingsPath)) {
@@ -128,9 +142,15 @@ function wireHooks(): string {
 
   const ensure = (event: string, matcher?: string): void => {
     const groups = (settings.hooks![event] ??= []);
-    const already = groups.some((g) => (g.hooks ?? []).some((h) => h.command === "clancey hook"));
-    if (already) return;
-    const group: HookGroup = { hooks: [{ type: "command", command: "clancey hook" }] };
+    for (const g of groups) {
+      for (const h of g.hooks ?? []) {
+        if (CLANCEY_HOOK_RE.test(h.command)) {
+          h.command = hookCmd;
+          return;
+        }
+      }
+    }
+    const group: HookGroup = { hooks: [{ type: "command", command: hookCmd }] };
     if (matcher) group.matcher = matcher;
     groups.push(group);
   };
@@ -163,27 +183,40 @@ function hasCodex(): boolean {
   return fs.existsSync(path.join(os.homedir(), ".codex"));
 }
 
-/** Add the clancey MCP server to Codex's config.toml, idempotently. */
-function configureCodex(): "added" | "exists" {
+/** Add (or re-pin) the clancey MCP server in Codex's config.toml, idempotently. */
+function configureCodex(spec: string): "added" | "updated" {
   const existing = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, "utf-8") : "";
-  if (existing.includes("[mcp_servers.clancey]")) return "exists";
-  const block = `${existing.endsWith("\n") || existing === "" ? "" : "\n"}\n[mcp_servers.clancey]\ncommand = "clancey"\nargs = []\n`;
+  const had = existing.includes("[mcp_servers.clancey]");
+  const block = `[mcp_servers.clancey]\ncommand = "npx"\nargs = ["-y", "${spec}"]\n`;
+
+  // Strip any existing clancey block so re-runs re-pin the version instead of duplicating.
+  const stripped = existing.replace(/\[mcp_servers\.clancey\][\s\S]*?(?=\n\[|$)/, "").replace(/\n{3,}/g, "\n\n").trim();
+  const content = stripped ? `${stripped}\n\n${block}` : block;
+
   fs.mkdirSync(path.dirname(CODEX_CONFIG), { recursive: true });
-  fs.appendFileSync(CODEX_CONFIG, block);
-  return "added";
+  fs.writeFileSync(CODEX_CONFIG, content);
+  return had ? "updated" : "added";
 }
 
-/** Register the MCP server at user scope. Checks for an existing registration first. */
-async function registerMcp(): Promise<"added" | "exists" | "failed"> {
+/** Register (or re-pin) the MCP server at user scope via pinned npx. */
+async function registerMcp(spec: string): Promise<"added" | "updated" | "failed"> {
+  let existed = false;
   try {
     await execFileAsync("claude", ["mcp", "get", "clancey"]);
-    return "exists";
+    existed = true;
   } catch {
     // not registered yet
   }
+  if (existed) {
+    try {
+      await execFileAsync("claude", ["mcp", "remove", "clancey"]);
+    } catch {
+      // best-effort; re-add below still re-pins
+    }
+  }
   try {
-    await execFileAsync("claude", ["mcp", "add", "--scope", "user", "clancey", "--", "clancey"]);
-    return "added";
+    await execFileAsync("claude", ["mcp", "add", "--scope", "user", "clancey", "--", "npx", "-y", spec]);
+    return existed ? "updated" : "added";
   } catch {
     return "failed";
   }
@@ -281,26 +314,27 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: ("claude" |
   intro("clancey setup");
 
   const targets = await selectTargets(opts.targets ?? null);
+  const spec = clanceySpec();
 
   if (targets.includes("claude")) {
-    clog.success(`Wired hooks into ${tildify(wireHooks())}`);
+    clog.success(`Wired hooks into ${tildify(wireHooks(spec))}`);
     const mcpSpin = spinner();
     mcpSpin.start("Registering Claude Code MCP server");
-    const mcp = await registerMcp();
-    if (mcp === "added") mcpSpin.stop("Registered Claude Code MCP server (user scope)");
-    else if (mcp === "exists") mcpSpin.stop("Claude Code MCP server already registered");
+    const mcp = await registerMcp(spec);
+    if (mcp === "added") mcpSpin.stop(`Registered Claude Code MCP server (${spec}, user scope)`);
+    else if (mcp === "updated") mcpSpin.stop(`Re-pinned Claude Code MCP server to ${spec}`);
     else {
       mcpSpin.stop("Could not register Claude Code MCP server");
-      clog.warn("Add manually: claude mcp add --scope user clancey -- clancey");
+      clog.warn(`Add manually: claude mcp add --scope user clancey -- npx -y ${spec}`);
     }
   }
 
   if (targets.includes("codex")) {
-    const codex = configureCodex();
+    const codex = configureCodex(spec);
     clog.success(
       codex === "added"
-        ? `Registered Codex MCP server in ${tildify(CODEX_CONFIG)}`
-        : "Codex MCP server already registered",
+        ? `Registered Codex MCP server (${spec}) in ${tildify(CODEX_CONFIG)}`
+        : `Re-pinned Codex MCP server to ${spec} in ${tildify(CODEX_CONFIG)}`,
     );
   }
 
