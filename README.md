@@ -18,7 +18,7 @@ Later you just ask Claude things like *"which conversation produced this PR, and
 npx -y clancey setup
 ```
 
-This sets Clancey up inside Claude Code and imports your existing conversation history so you can ask about it right away. Restart Claude Code when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
+Setup asks which tools to enable Clancey for (Claude Code and Codex), then imports your existing history from both so you can ask about it right away. Restart your tools when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
 
 ## Using it
 
@@ -29,6 +29,8 @@ You never call Clancey directly. Claude does, whenever you ask it about past wor
 - *"What was I thinking the last time I changed `GameRepository.ts`?"*
 
 As you work, Claude records the decisions it makes so they're searchable later. You can also ask it to go back through your older sessions and fill in the decisions it finds, so even history from before you installed Clancey becomes useful.
+
+Codex works too, with one difference: Clancey imports your Codex history and answers from inside Codex, but it only records live as you work in Claude Code.
 
 > Tip: when asking about a PR, point Claude at a changed file rather than the branch name. Branch names drift (worktrees, renames, stacked PRs); the files you touched are the reliable trail.
 
