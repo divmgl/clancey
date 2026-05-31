@@ -11,6 +11,7 @@ Publishing to npm is automated by `.github/workflows/publish.yml` on every push 
 - The `verify` job runs typecheck + test + build *before* the bump is detected. If a test fails, the "Detect version bump" step is skipped and nothing publishes — a red CI silently means no release. Make CI green first.
 - The publish job also refuses to republish an already-published version, so a stale/duplicate version is a no-op.
 - Keep the npm version, the git tag, and the GitHub release in sync. When you bump, create/update the matching `vX.Y.Z` release.
+- Release titles follow `X.Y.Z - Title` (e.g. `1.1.0 - Conversations survive transcript pruning`). The version in the title must match the tag.
 
 To cut a release: bump `version` in `package.json`, commit (`chore: Release vX.Y.Z`), push to `main`, confirm the publish run published, then create the GitHub release for the tag.
 
