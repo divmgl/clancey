@@ -246,10 +246,11 @@ async function cleanLegacyIndex(clean: boolean): Promise<void> {
 }
 
 /** Pick which tools to register the MCP server with — detected ones pre-selected. */
-async function selectTargets(): Promise<("claude" | "codex")[]> {
+async function selectTargets(preset: ("claude" | "codex")[] | null): Promise<("claude" | "codex")[]> {
   const detected = { claude: await hasClaude(), codex: hasCodex() };
   const installed = (["claude", "codex"] as const).filter((t) => detected[t]);
 
+  if (preset) return preset;
   if (!process.stdin.isTTY) return [...installed];
 
   const selected = await multiselect<"all" | "claude" | "codex">({
@@ -271,11 +272,11 @@ async function selectTargets(): Promise<("claude" | "codex")[]> {
 }
 
 /** `clancey setup` — register the MCP server with the chosen tools, backfill, then clean the v1 index. */
-export async function setup(opts: { cleanLegacy?: boolean } = {}): Promise<void> {
+export async function setup(opts: { cleanLegacy?: boolean; targets?: ("claude" | "codex")[] } = {}): Promise<void> {
   setConsoleSilent(true); // clack owns the terminal; log() keeps writing to the file
   intro("clancey setup");
 
-  const targets = await selectTargets();
+  const targets = await selectTargets(opts.targets ?? null);
 
   if (targets.includes("claude")) {
     clog.success(`Wired hooks into ${tildify(wireHooks())}`);

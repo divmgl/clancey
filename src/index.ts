@@ -211,8 +211,12 @@ MCP server at user scope, offers to remove the legacy v1 index, then backfills
 existing conversations.
 
 Options:
+  --tools <list>              Comma-separated tools to set up, non-interactively:
+                              claude, codex, or all (e.g. --tools codex). Skips the
+                              picker. Default is the interactive picker; with no TTY,
+                              all detected tools.
   --clean-legacy, --yes, -y   Delete the legacy v1 index (~/.clancey/conversations.lance)
-                              without prompting. Default is an interactive [y/N] prompt;
+                              without prompting. Default is an interactive [Y/n] prompt;
                               with no TTY it is never deleted.
   -h, --help                  Show this help.`;
 
@@ -226,6 +230,28 @@ Options:
 
 function wantsHelp(args: string[]): boolean {
   return args.includes("--help") || args.includes("-h");
+}
+
+/** Parse `--tools claude,codex` (or `--tools=all`) into an explicit target list. */
+function parseTools(args: string[]): ("claude" | "codex")[] | undefined {
+  const eq = args.find((a) => a.startsWith("--tools="));
+  const idx = args.indexOf("--tools");
+  const raw = eq ? eq.slice("--tools=".length) : idx !== -1 ? args[idx + 1] : undefined;
+  if (raw === undefined) return undefined;
+
+  const out = new Set<"claude" | "codex">();
+  for (const part of raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    if (part === "all") {
+      out.add("claude");
+      out.add("codex");
+    } else if (part === "claude" || part === "codex") {
+      out.add(part);
+    } else {
+      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, all)`);
+      process.exit(1);
+    }
+  }
+  return [...out];
 }
 
 async function main(): Promise<void> {
@@ -250,7 +276,7 @@ async function main(): Promise<void> {
         return;
       }
       const cleanLegacy = rest.includes("--clean-legacy") || rest.includes("--yes") || rest.includes("-y");
-      await setup({ cleanLegacy });
+      await setup({ cleanLegacy, targets: parseTools(rest) });
       return;
     }
     case "backfill": {
