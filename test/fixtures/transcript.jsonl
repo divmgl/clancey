@@ -1,0 +1,9 @@
+{"type":"user","isMeta":true,"timestamp":"2026-01-01T10:00:00Z","gitBranch":"main","cwd":"/repo","message":{"content":"meta entry that should be ignored entirely"}}
+{"type":"user","timestamp":"2026-01-01T10:00:01Z","gitBranch":"feature/x","cwd":"/repo","aiTitle":"My feature work","message":{"content":"We need to refactor the auth module because it is tangled and hard to test."}}
+{"type":"assistant","timestamp":"2026-01-01T10:00:02Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":[{"type":"text","text":"Sure, editing now."},{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/src/auth.ts"}}]}}
+{"type":"assistant","timestamp":"2026-01-01T10:00:03Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"bun test"}}]}}
+{"type":"assistant","timestamp":"2026-01-01T10:00:04Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/other.ts"}}]}}
+{"type":"user","timestamp":"2026-01-01T10:00:05Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":"short"}}
+{"type":"user","timestamp":"2026-01-01T10:00:06Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":"<command-name>clear</command-name> this should be filtered as a command"}}
+{"type":"user","timestamp":"2026-01-01T10:00:07Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":[{"type":"text","text":"Let's also add a test for the token refresh path."}]}}
+{"type":"user","timestamp":"2026-01-01T10:00:08Z","gitBranch":"feature/x","cwd":"/repo","message":{"content":[{"type":"tool_result","content":"a tool result that is not a human turn"}]}}

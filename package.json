@@ -1,7 +1,7 @@
 {
   "name": "clancey",
-  "version": "0.5.1",
-  "description": "MCP server that indexes Claude Code and Codex conversations for semantic search",
+  "version": "1.0.0",
+  "description": "MCP server that captures provenance from Claude Code conversations: map a branch or file to the sessions that produced it, recall recorded decisions, and read the verbatim turns",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -17,31 +17,37 @@
   "scripts": {
     "prepare": "npm run build",
     "prepublishOnly": "npm run build",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@lancedb/lancedb --external:@huggingface/transformers --external:onnxruntime-node --banner:js=\"#!/usr/bin/env node\"",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --external:@huggingface/transformers --external:onnxruntime-node --external:better-sqlite3 --banner:js=\"#!/usr/bin/env node\"",
     "dev": "bun run build --watch",
     "start": "node dist/index.js",
-    "test": "bun test",
+    "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "mcp",
     "claude",
-    "codex",
+    "claude-code",
     "conversation",
-    "search",
-    "lancedb"
+    "provenance",
+    "decisions"
   ],
   "author": "Dexter Miguel",
   "license": "MIT",
   "dependencies": {
-    "@huggingface/transformers": "^3.8.1",
-    "@lancedb/lancedb": "^0.23.0",
-    "@modelcontextprotocol/sdk": "^1.25.3",
-    "chokidar": "^5.0.0"
+    "@clack/prompts": "^1.5.0",
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.10.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "esbuild": "^0.27.2",
-    "typescript": "^5.7.0"
-  }
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.9.1",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ]
 }

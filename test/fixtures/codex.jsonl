@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-02-01T10:00:00Z","payload":{"cwd":"/repo","git":{"branch":"feature/codex","commit_hash":"abc","repository_url":"git@example.com:x.git"}}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n<INSTRUCTIONS> boilerplate that should be filtered"}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Refactor the state management API to drop all casting."}]}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:03Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"rg -n useState packages\",\"workdir\":\"/repo/packages/web\"}"}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:04Z","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: packages/web/src/state.ts\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-02-01T10:00:05Z","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bun\",\"test\"]}"}}
+{"type":"event_msg","timestamp":"2026-02-01T10:00:06Z","payload":{"type":"token_count"}}

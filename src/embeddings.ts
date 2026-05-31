@@ -79,4 +79,31 @@ export async function embedOne(text: string): Promise<number[]> {
   return data[0];
 }
 
+/** Serialize an embedding to a Float32 BLOB for SQLite storage. */
+export function vectorToBlob(vector: number[]): Buffer {
+  return Buffer.from(Float32Array.from(vector).buffer);
+}
+
+/** Deserialize a Float32 BLOB back into a vector. */
+export function blobToVector(blob: Buffer): Float32Array {
+  return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+}
+
+/**
+ * Cosine similarity. Model output is L2-normalized, so this is effectively a dot
+ * product, but we normalize defensively in case an upstream vector is not unit length.
+ */
+export function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
 export { EMBEDDING_DIMENSIONS };

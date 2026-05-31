@@ -3,105 +3,144 @@
 [![CI](https://github.com/divmgl/clancey/actions/workflows/ci.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/ci.yml)
 [![Publish to npm](https://github.com/divmgl/clancey/actions/workflows/publish.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/publish.yml)
 
-An MCP server that indexes your Claude Code and Codex conversations for semantic search. Find solutions, decisions, and context from previous coding sessions.
+An MCP server that captures **provenance** from your Claude Code conversations. Given a branch or a changed file, find the sessions that produced it, recall the decisions you made, and read the verbatim turns where you made them.
 
-## Features
+Clancey is built for a deterministic question — *"which conversation produced this PR, and why did we do it this way?"* — not fuzzy recall. The mapping (branch/file → session) is exact; the reasoning is the LLM's job, captured as you work and read back on demand.
 
-- **Semantic Search** - Find conversations by meaning, not just keywords
-- **Auto-Indexing** - Automatically indexes new conversations as they happen
-- **Local & Private** - Everything runs locally using LanceDB and a Huggingface model
-- **Resumable** - Indexing saves progress incrementally, picks up where it left off
-- **Fast** - Uses all-MiniLM-L6-v2 for quick, lightweight embeddings
+## What it does
 
-## Installation
+- **Captures provenance deterministically.** A `PostToolUse` hook records every file edit and command, tagged with the repo and branch, as it happens. No re-indexing, no embeddings of raw transcripts.
+- **Records your decisions.** The hook reminds the agent to log significant decisions (`record_decision`) with their rationale, anchored to the repo and branch.
+- **Maps PR → session.** `recall` answers "what work happened on this branch / to this file, and where do I read it" with an indexed SQL lookup.
+- **Searches decisions semantically.** `search` ranks recorded decisions and session framings by meaning — short, high-signal text, so a small local embedding model does the job well.
+- **Reads the verbatim turns.** `read_turns` returns what you actually said in a session, the deep dive that recovers a PR's motivation in your own words.
+- **Covers Codex too.** Existing Codex sessions (`~/.codex/sessions`) are backfilled — file edits (`apply_patch`), commands (`exec_command`/`shell`), branch, and turns. Codex has no hook, so it's backfill-only (no live capture or decision nudges).
 
-Use the setup for your client:
+## Prerequisites
 
-<details>
-<summary>Claude Code</summary>
+- **Node 18+** — clancey runs on Node (via `npx`); `better-sqlite3` ships prebuilt binaries for it.
+- **The `claude` CLI** — used by `setup` to register the MCP server (`claude mcp add`). If it's not on your `PATH`, setup prints the manual command to run.
+- A first run downloads the embedding model (`all-MiniLM-L6-v2`, ~30 MB), cached afterward.
 
-Add to your Claude Code MCP settings (`~/.claude/settings.json`):
+## Setup
+
+```bash
+npx -y clancey setup
+```
+
+This wires the hooks into your global Claude Code settings (`~/.claude/settings.json`), registers the MCP server at user scope, offers to remove any legacy v1 index, and backfills your existing conversations so history is queryable immediately. Restart Claude Code afterward.
+
+Non-interactive (also deletes the legacy index without asking):
+
+```bash
+npx -y clancey setup --clean-legacy
+```
+
+## The legacy v1 LanceDB index
+
+v0 (clancey ≤ 0.x) was a semantic-recall tool: it embedded raw 2000-char transcript chunks — **tool calls stripped** — into a LanceDB index at `~/.clancey/conversations.lance`. These indexes are large (tens of GB) and faulty, so `setup` offers to remove it once the new SQLite store is built. Nothing is ever deleted without your consent: an empty index dir (the published v0 server recreates one on every launch) is left untouched, and a non-empty one is only removed on confirmation or `--clean-legacy`.
+
+There is no automatic migration from the v0 index, by design. Because v0 stripped tool calls, its rows carry no file/branch provenance — the entire point of v1 — so a migrated session could never answer `recall`, only `search`/`read`. The only thing a migration would rescue is semantic search and verbatim text over conversations already **pruned off disk** by the 30-day retention window (see below); everything still on disk is backfilled properly, with provenance. If you want that history back, **keep the v0 index** (or a copy) instead of deleting it — the data is preserved so a pruned-only migration stays possible later. For most users it isn't worth it.
+
+## How it works
+
+1. A `PostToolUse` hook runs `clancey hook` after each `Edit`/`Write`/`Bash`. It resolves the repo (git top-level, shared across worktrees) and current branch, records the event, and — throttled — nudges the agent to call `record_decision` after significant decisions.
+2. A `SessionStart` hook injects the standing reminder to log decisions as you go.
+3. Everything is stored in one SQLite file at `~/.clancey/clancey.db`: an `events` table (provenance + decisions, indexed by repo/branch/file) and an `embeddings` table (decision and framing vectors).
+4. `clancey backfill` reads your existing Claude Code and Codex transcripts into the same store — every file edit becomes an event, and each session gets a framing embedding (its title + first message) so it is searchable even before any decision is recorded.
+
+## Retention — keep your transcripts
+
+Claude Code deletes chat transcripts after `cleanupPeriodDays` (**default 30**). Once a transcript is pruned, `read_turns` can no longer recover its verbatim turns — and any session older than the window is simply gone. clancey's own store is durable: the `events` and recorded `decisions` in `clancey.db` persist independently of pruning, so provenance and decisions survive. But to keep the *verbatim turns* available, raise the retention window in `~/.claude/settings.json`:
 
 ```json
 {
-  "mcpServers": {
-    "clancey": {
-      "command": "npx",
-      "args": ["-y", "clancey"]
-    }
-  }
+  "cleanupPeriodDays": 3650
 }
 ```
 
-Restart Claude Code.
+Do this early — pruned history can't be recovered. (clancey captures live going forward regardless, but it can only backfill transcripts that still exist on disk.)
 
-</details>
+## MCP tools
 
-<details>
-<summary>Codex</summary>
+### `recall`
 
-Add to your Codex config (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.clancey]
-command = "npx"
-args = ["-y", "clancey"]
-```
-
-Restart Codex.
-
-</details>
-
-## MCP Tools
-
-### `search_conversations`
-
-Search through your indexed conversations semantically.
+Deterministically find the work for a branch, file, or repo. The PR → session mapping.
 
 ```
-query: "how did I fix the auth bug"
-limit: 5
-project: "my-app"  # optional filter
+recall({ file: "GameRepository.ts" })
+recall({ branch: "feature/auth" })
 ```
 
-### `index_conversations`
+> Tip: prefer `file` over `branch`. PR head refs often diverge from the branch recorded in the transcript (worktrees, Graphite, renames); the edited file paths are the reliable key.
 
-Manually trigger conversation indexing.
+### `read_turns`
+
+Read the verbatim human turns from a session, optionally only the slice where a branch was active.
 
 ```
-force: true  # reindex everything
+read_turns({ session: "aab3c4f4-…" })
 ```
 
-### `index_status`
+### `search`
 
-Get statistics about indexed conversations.
+Semantic search over recorded decisions and session framings, ranked by similarity descending. The open case: "what did I decide about X" when you don't know the branch.
 
-## How It Works
+```
+search({ query: "why did we move auth to the edge" })
+```
 
-1. Scans conversation files from `~/.claude/projects/` and `~/.codex/sessions/`
-2. Parses JSONL events into user/assistant messages
-3. Chunks long conversations into searchable segments
-4. Generates embeddings with `all-MiniLM-L6-v2`
-5. Stores vectors in LanceDB at `~/.clancey/conversations.lance`
-6. Watches both source directories and incrementally re-indexes changed `.jsonl` files
+### `record_decision`
 
-Data is stored in `~/.clancey/`. Logs are at `~/.clancey/clancey.log`.
+Record a decision and its rationale, anchored to the current repo and branch (provided in the hook's context). Call this copiously while working.
+
+```
+record_decision({ repo, branch, decision, why })
+```
+
+## Filling in decisions for past sessions
+
+History is indexed immediately, but old sessions have no recorded decisions — no agent was there to record them. Fill them in with a **host-agent pass**: ask Claude to walk your history using the tools above.
+
+```
+recall({ file: "X" })            → find the sessions and files
+read_turns({ session })          → read what was actually said
+record_decision({ repo, branch, decision, why })  → write the synthesized decision back
+```
+
+After the pass, `recall` and `search` surface those decisions. Going forward, new sessions accrue decisions automatically via the hook.
+
+## CLI
+
+```
+clancey            Start the MCP server (stdio)
+clancey setup      Wire hooks + MCP globally, clean legacy index, backfill
+                   --clean-legacy / --yes   delete the v1 index non-interactively
+clancey hook       Invoked by Claude Code hooks (reads the event on stdin)
+clancey backfill   Ingest existing transcripts ( --force to re-ingest all )
+```
+
+## Storage
+
+Everything lives in `~/.clancey/`:
+
+- `clancey.db` — the SQLite store (events, embeddings, state).
+- `clancey.log` — operational log.
+
+## Tech stack
+
+- [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) — embedded SQLite store
+- [Transformers.js](https://huggingface.co/docs/transformers.js) — `all-MiniLM-L6-v2` embeddings over short summaries
+- [MCP SDK](https://github.com/modelcontextprotocol/sdk) — Claude Code integration
 
 ## Development
 
 ```bash
-git clone https://github.com/divmgl/clancey.git
-cd clancey
 bun install
+bun run typecheck
+bun run test     # runs under node + tsx (better-sqlite3 is Node-only)
 bun run build
 ```
-
-## Tech Stack
-
-- [LanceDB](https://lancedb.com/) - Vector database
-- [Huggingface Transformers.js](https://huggingface.co/docs/transformers.js) - Embedding model
-- [MCP SDK](https://github.com/modelcontextprotocol/sdk) - Claude integration
-- [Chokidar](https://github.com/paulmillr/chokidar) - File watching
 
 ## License
 

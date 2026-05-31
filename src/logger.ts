@@ -12,6 +12,13 @@ try {
   // ignore
 }
 
+let consoleSilent = false;
+
+/** Silence stderr output (file logging continues). Used by interactive commands that own the terminal. */
+export function setConsoleSilent(silent: boolean): void {
+  consoleSilent = silent;
+}
+
 export function log(message: string, ...args: unknown[]): void {
   const timestamp = new Date().toISOString();
   const formatted = args.length > 0
@@ -27,8 +34,10 @@ export function log(message: string, ...args: unknown[]): void {
     // ignore write errors
   }
 
-  // Also write to stderr for MCP
-  console.error(`[clancey] ${formatted}`);
+  // Also write to stderr (MCP server diagnostics); the file copy keeps the timestamp.
+  if (!consoleSilent) {
+    console.error(formatted);
+  }
 }
 
 export function logError(message: string, error: unknown): void {

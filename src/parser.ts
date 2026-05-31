@@ -3,53 +3,45 @@ import path from "path";
 import os from "os";
 import readline from "readline";
 
-export interface Message {
-  role: "user" | "assistant";
-  content: string;
+const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+export interface ToolEvent {
+  tool: string;
+  file: string | null;
+  command: string | null;
+  branch: string | null;
+  cwd: string | null;
   timestamp: string;
 }
 
-export interface Conversation {
-  sessionId: string;
-  project: string;
-  messages: Message[];
-  filePath: string;
-  lastModified: number;
-}
-
-export interface ConversationChunk {
-  id: string;
-  sessionId: string;
-  project: string;
-  content: string;
+export interface UserTurn {
+  text: string;
+  branch: string | null;
   timestamp: string;
-  chunkIndex: number;
 }
 
-export function getClaudeDir(): string {
-  return path.join(os.homedir(), ".claude");
+export interface ParsedTranscript {
+  sessionId: string;
+  title: string | null;
+  toolEvents: ToolEvent[];
+  userTurns: UserTurn[];
+  /** First substantive human turn — the session's framing, used as a search anchor. */
+  framing: string | null;
 }
 
 export function getProjectsDir(): string {
-  return path.join(getClaudeDir(), "projects");
-}
-
-export function getCodexDir(): string {
-  return path.join(os.homedir(), ".codex");
+  return path.join(os.homedir(), ".claude", "projects");
 }
 
 export function getCodexSessionsDir(): string {
-  return path.join(getCodexDir(), "sessions");
+  return path.join(os.homedir(), ".codex", "sessions");
 }
 
-export function getConversationWatchDirs(): string[] {
-  return [getProjectsDir(), getCodexSessionsDir()].filter((dir) => fs.existsSync(dir));
-}
+export type TranscriptKind = "claude" | "codex";
 
-function isCodexConversationFile(filePath: string): boolean {
-  const codexSessionsDir = path.normalize(getCodexSessionsDir());
-  const normalized = path.normalize(filePath);
-  return normalized.startsWith(`${codexSessionsDir}${path.sep}`);
+export interface TranscriptRef {
+  path: string;
+  kind: TranscriptKind;
 }
 
 export function decodeClaudeProject(projectDir: string): string {
@@ -58,6 +50,7 @@ export function decodeClaudeProject(projectDir: string): string {
     : projectDir;
 }
 
+/** Extract plain text from a message's content (string, or an array of text blocks). */
 export function extractTextContent(content: unknown): string {
   if (typeof content === "string") {
     return content.trim();
@@ -66,11 +59,11 @@ export function extractTextContent(content: unknown): string {
   if (Array.isArray(content)) {
     return content
       .filter(
-        (block: any) =>
+        (block: { type?: string; text?: unknown }) =>
           typeof block?.text === "string" &&
-          (block.type === "text" || block.type === "input_text" || block.type === "output_text")
+          (block.type === "text" || block.type === "input_text" || block.type === "output_text"),
       )
-      .map((block: any) => block.text)
+      .map((block: { text: string }) => block.text)
       .join("\n")
       .trim();
   }
@@ -78,26 +71,29 @@ export function extractTextContent(content: unknown): string {
   return "";
 }
 
-function isCodexBoilerplateMessage(text: string): boolean {
-  const trimmed = text.trim();
+/** Boilerplate / non-human user entries that carry no decision signal. */
+function isNoiseUserText(text: string): boolean {
   return (
-    trimmed.startsWith("# AGENTS.md instructions for ") ||
-    trimmed.startsWith("<environment_context>") ||
-    trimmed.startsWith("<permissions instructions>") ||
-    trimmed.startsWith("<collaboration_mode>") ||
-    trimmed.startsWith("<user_instructions>")
+    text.length < 20 ||
+    text.startsWith("<command-name>") ||
+    text.startsWith("<local-command") ||
+    text.startsWith("<bash-") ||
+    text.startsWith("<system-reminder") ||
+    text.startsWith("<task-notification") ||
+    text.startsWith("Caveat:") ||
+    text.startsWith("This session is being continued")
   );
 }
 
-async function listClaudeConversationFiles(): Promise<string[]> {
+/**
+ * List session transcript files: the `<sessionId>.jsonl` files directly under each project
+ * directory in ~/.claude/projects. Skips nested `subagents/` transcripts and the memory dir.
+ */
+export async function listConversationFiles(): Promise<string[]> {
   const projectsDir = getProjectsDir();
   const files: string[] = [];
 
-  if (!fs.existsSync(projectsDir)) {
-    return files;
-  }
-
-  let projects: string[] = [];
+  let projects: string[];
   try {
     projects = await fs.promises.readdir(projectsDir);
   } catch {
@@ -106,26 +102,15 @@ async function listClaudeConversationFiles(): Promise<string[]> {
 
   for (const project of projects) {
     const projectPath = path.join(projectsDir, project);
-
-    let stat: fs.Stats;
+    let entries: fs.Dirent[];
     try {
-      stat = await fs.promises.stat(projectPath);
+      entries = await fs.promises.readdir(projectPath, { withFileTypes: true });
     } catch {
       continue;
     }
-
-    if (!stat.isDirectory()) continue;
-
-    let projectFiles: string[] = [];
-    try {
-      projectFiles = await fs.promises.readdir(projectPath);
-    } catch {
-      continue;
-    }
-
-    for (const file of projectFiles) {
-      if (file.endsWith(".jsonl")) {
-        files.push(path.join(projectPath, file));
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        files.push(path.join(projectPath, entry.name));
       }
     }
   }
@@ -133,219 +118,212 @@ async function listClaudeConversationFiles(): Promise<string[]> {
   return files;
 }
 
-async function collectJsonlFilesRecursive(dir: string, files: string[]): Promise<void> {
-  let entries: fs.Dirent[] = [];
+async function collectJsonl(dir: string, out: string[]): Promise<void> {
+  let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
   } catch {
     return;
   }
-
   for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      await collectJsonlFilesRecursive(fullPath, files);
-      continue;
-    }
-
-    if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      files.push(fullPath);
-    }
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) await collectJsonl(full, out);
+    else if (entry.isFile() && entry.name.endsWith(".jsonl")) out.push(full);
   }
 }
 
-async function listCodexConversationFiles(): Promise<string[]> {
-  const sessionsDir = getCodexSessionsDir();
+/** Codex stores sessions nested by date under ~/.codex/sessions. */
+export async function listCodexFiles(): Promise<string[]> {
   const files: string[] = [];
+  await collectJsonl(getCodexSessionsDir(), files);
+  return files;
+}
 
-  if (!fs.existsSync(sessionsDir)) {
-    return files;
+/** All ingestable transcripts across Claude Code and Codex, tagged by kind. */
+export async function listAllTranscripts(): Promise<TranscriptRef[]> {
+  const [claude, codex] = await Promise.all([listConversationFiles(), listCodexFiles()]);
+  return [
+    ...claude.map((p): TranscriptRef => ({ path: p, kind: "claude" })),
+    ...codex.map((p): TranscriptRef => ({ path: p, kind: "codex" })),
+  ];
+}
+
+/** Resolve a session id to its transcript (searches Claude then Codex), or null. */
+export async function resolveSession(sessionId: string): Promise<TranscriptRef | null> {
+  const all = await listAllTranscripts();
+  return all.find((r) => path.basename(r.path, ".jsonl") === sessionId) ?? null;
+}
+
+/** Parse one transcript into tool events, human turns, title, and framing. */
+export async function parseTranscript(filePath: string): Promise<ParsedTranscript> {
+  const sessionId = path.basename(filePath, ".jsonl");
+  const toolEvents: ToolEvent[] = [];
+  const userTurns: UserTurn[] = [];
+  let title: string | null = null;
+
+  const rl = readline.createInterface({
+    input: fs.createReadStream(filePath),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+
+    let obj: {
+      type?: string;
+      isMeta?: boolean;
+      aiTitle?: unknown;
+      gitBranch?: unknown;
+      cwd?: unknown;
+      timestamp?: unknown;
+      message?: { content?: unknown };
+    };
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (typeof obj.aiTitle === "string") title = obj.aiTitle;
+
+    const branch = typeof obj.gitBranch === "string" ? obj.gitBranch : null;
+    const cwd = typeof obj.cwd === "string" ? obj.cwd : null;
+    const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "";
+
+    if (obj.type === "assistant") {
+      const content = obj.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content as Array<{ type?: string; name?: string; input?: Record<string, unknown> }>) {
+        if (block?.type !== "tool_use" || typeof block.name !== "string") continue;
+        const tool = block.name;
+        const input = block.input ?? {};
+        if (FILE_TOOLS.has(tool) && typeof input.file_path === "string") {
+          toolEvents.push({ tool, file: input.file_path, command: null, branch, cwd, timestamp });
+        } else if (tool === "Bash" && typeof input.command === "string") {
+          toolEvents.push({ tool, file: null, command: input.command, branch, cwd, timestamp });
+        }
+      }
+      continue;
+    }
+
+    if (obj.type === "user") {
+      if (obj.isMeta) continue;
+      const text = extractTextContent(obj.message?.content);
+      if (!text || isNoiseUserText(text)) continue;
+      userTurns.push({ text, branch, timestamp });
+    }
   }
 
-  await collectJsonlFilesRecursive(sessionsDir, files);
+  return { sessionId, title, toolEvents, userTurns, framing: userTurns[0]?.text ?? null };
+}
+
+/** Codex command tools, across versions: `shell` (array cmd), `exec_command`/`shell_command` (string cmd). */
+const CODEX_COMMAND_TOOLS = new Set(["shell", "exec_command", "shell_command"]);
+
+/** Codex injects AGENTS.md and environment context as user messages — not human turns. */
+function isCodexBoilerplate(text: string): boolean {
+  return (
+    text.startsWith("# AGENTS.md instructions for ") ||
+    text.startsWith("<environment_context>") ||
+    text.startsWith("<user_instructions>") ||
+    text.startsWith("<INSTRUCTIONS>")
+  );
+}
+
+/** File paths touched by an apply_patch body (`*** Add/Update/Delete File: <path>`). */
+function extractPatchFiles(text: string): string[] {
+  const files: string[] = [];
+  const re = /\*\*\* (?:Add|Update|Delete) File: (.+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) files.push(m[1].trim());
   return files;
 }
 
 /**
- * List all conversation files across all projects
+ * Parse a Codex session transcript. Repo + branch come from `session_meta` (one per
+ * session); file/command events come from `shell` function calls (and the apply_patch
+ * bodies inside them). Codex has no hook, so this is backfill-only.
  */
-export async function listConversationFiles(): Promise<string[]> {
-  const [claudeFiles, codexFiles] = await Promise.all([
-    listClaudeConversationFiles(),
-    listCodexConversationFiles(),
-  ]);
-
-  return Array.from(new Set([...claudeFiles, ...codexFiles]));
-}
-
-async function parseClaudeConversation(filePath: string, stat: fs.Stats): Promise<Conversation | null> {
+export async function parseCodexTranscript(filePath: string): Promise<ParsedTranscript> {
   const sessionId = path.basename(filePath, ".jsonl");
-  const projectDir = path.basename(path.dirname(filePath));
-  const project = decodeClaudeProject(projectDir);
-  const messages: Message[] = [];
+  const toolEvents: ToolEvent[] = [];
+  const userTurns: UserTurn[] = [];
+  let cwd: string | null = null;
+  let branch: string | null = null;
 
-  const fileStream = fs.createReadStream(filePath);
-  const rl = readline.createInterface({
-    input: fileStream,
-    crlfDelay: Infinity,
-  });
+  const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
 
   for await (const line of rl) {
     if (!line.trim()) continue;
-
+    let obj: {
+      type?: string;
+      timestamp?: unknown;
+      payload?: {
+        type?: string;
+        role?: string;
+        name?: string;
+        arguments?: unknown;
+        input?: unknown;
+        content?: unknown;
+        cwd?: unknown;
+        git?: { branch?: unknown };
+      };
+    };
     try {
-      const obj = JSON.parse(line);
-
-      if (obj.isMeta) continue;
-      if (obj.type === "file-history-snapshot") continue;
-      if (obj.type === "summary") continue;
-      if (obj.type !== "user" && obj.type !== "assistant") continue;
-
-      const content = obj.message?.content;
-      const textContent = extractTextContent(content);
-
-      if (!textContent) continue;
-      if (textContent.startsWith("<command-name>")) continue;
-      if (textContent.startsWith("<local-command")) continue;
-      if (textContent.length < 20) continue;
-
-      messages.push({
-        role: obj.type as "user" | "assistant",
-        content: textContent,
-        timestamp: obj.timestamp || new Date().toISOString(),
-      });
+      obj = JSON.parse(line);
     } catch {
       continue;
     }
-  }
 
-  if (messages.length === 0) {
-    return null;
-  }
+    if (obj.type === "session_meta") {
+      if (typeof obj.payload?.cwd === "string") cwd = obj.payload.cwd;
+      if (typeof obj.payload?.git?.branch === "string") branch = obj.payload.git.branch;
+      continue;
+    }
+    if (obj.type !== "response_item") continue;
 
-  return {
-    sessionId,
-    project,
-    messages,
-    filePath,
-    lastModified: stat.mtimeMs,
-  };
-}
+    const p = obj.payload;
+    const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "";
 
-export async function parseCodexConversation(filePath: string, stat: fs.Stats): Promise<Conversation | null> {
-  const sessionId = path.basename(filePath, ".jsonl");
-  const messages: Message[] = [];
-  let project = "codex";
-
-  const fileStream = fs.createReadStream(filePath);
-  const rl = readline.createInterface({
-    input: fileStream,
-    crlfDelay: Infinity,
-  });
-
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-
-    try {
-      const obj = JSON.parse(line);
-
-      if (obj.type === "session_meta") {
-        const cwd = obj.payload?.cwd;
-        if (typeof cwd === "string" && cwd.length > 0) {
-          project = cwd;
-        }
-        continue;
+    if (p?.type === "message" && p.role === "user") {
+      const text = extractTextContent(p.content);
+      if (!text || isNoiseUserText(text) || isCodexBoilerplate(text)) continue;
+      userTurns.push({ text, branch, timestamp });
+    } else if (p?.type === "function_call" && typeof p.name === "string" && CODEX_COMMAND_TOOLS.has(p.name)) {
+      let command: string | null = null;
+      let workdir: string | null = null;
+      try {
+        const args = (typeof p.arguments === "string" ? JSON.parse(p.arguments) : p.arguments) as {
+          command?: unknown;
+          cmd?: unknown;
+          workdir?: unknown;
+        };
+        if (Array.isArray(args?.command)) command = args.command.join(" ");
+        else if (typeof args?.command === "string") command = args.command;
+        else if (typeof args?.cmd === "string") command = args.cmd;
+        if (typeof args?.workdir === "string") workdir = args.workdir;
+      } catch {
+        command = null;
       }
-
-      if (obj.type !== "response_item") continue;
-      if (obj.payload?.type !== "message") continue;
-
-      const role = obj.payload?.role;
-      if (role !== "user" && role !== "assistant") continue;
-
-      const textContent = extractTextContent(obj.payload?.content);
-      if (!textContent) continue;
-      if (isCodexBoilerplateMessage(textContent)) continue;
-      if (textContent.length < 20) continue;
-
-      messages.push({
-        role,
-        content: textContent,
-        timestamp: obj.timestamp || new Date().toISOString(),
-      });
-    } catch {
-      continue;
+      if (command) {
+        const evCwd = workdir ?? cwd;
+        toolEvents.push({ tool: p.name, file: null, command, branch, cwd: evCwd, timestamp });
+        for (const file of extractPatchFiles(command)) {
+          toolEvents.push({ tool: "apply_patch", file, command: null, branch, cwd: evCwd, timestamp });
+        }
+      }
+    } else if (p?.type === "custom_tool_call" && p.name === "apply_patch") {
+      const patch = typeof p.input === "string" ? p.input : "";
+      for (const file of extractPatchFiles(patch)) {
+        toolEvents.push({ tool: "apply_patch", file, command: null, branch, cwd, timestamp });
+      }
     }
   }
 
-  if (messages.length === 0) {
-    return null;
-  }
-
-  return {
-    sessionId,
-    project,
-    messages,
-    filePath,
-    lastModified: stat.mtimeMs,
-  };
+  return { sessionId, title: null, toolEvents, userTurns, framing: userTurns[0]?.text ?? null };
 }
 
-/**
- * Parse a single conversation JSONL file
- */
-export async function parseConversation(filePath: string): Promise<Conversation | null> {
-  const stat = await fs.promises.stat(filePath);
-  if (isCodexConversationFile(filePath)) {
-    return parseCodexConversation(filePath, stat);
-  }
-
-  return parseClaudeConversation(filePath, stat);
-}
-
-/**
- * Chunk a conversation into smaller pieces for embedding
- */
-export function chunkConversation(conversation: Conversation, maxChunkSize = 2000): ConversationChunk[] {
-  const chunks: ConversationChunk[] = [];
-  let currentChunk = "";
-  let chunkIndex = 0;
-  let chunkTimestamp = conversation.messages[0]?.timestamp || new Date().toISOString();
-
-  for (const message of conversation.messages) {
-    const prefix = message.role === "user" ? "User: " : "Assistant: ";
-    const messageText = `${prefix}${message.content}\n\n`;
-
-    // If adding this message would exceed max size, save current chunk
-    if (currentChunk.length + messageText.length > maxChunkSize && currentChunk.length > 0) {
-      chunks.push({
-        id: `${conversation.sessionId}-${chunkIndex}`,
-        sessionId: conversation.sessionId,
-        project: conversation.project,
-        content: currentChunk.trim(),
-        timestamp: chunkTimestamp,
-        chunkIndex,
-      });
-      currentChunk = "";
-      chunkIndex++;
-      chunkTimestamp = message.timestamp;
-    }
-
-    currentChunk += messageText;
-  }
-
-  // Don't forget the last chunk
-  if (currentChunk.trim().length > 0) {
-    chunks.push({
-      id: `${conversation.sessionId}-${chunkIndex}`,
-      sessionId: conversation.sessionId,
-      project: conversation.project,
-      content: currentChunk.trim(),
-      timestamp: chunkTimestamp,
-      chunkIndex,
-    });
-  }
-
-  return chunks;
+/** Parse any transcript by kind. */
+export function parseAny(ref: TranscriptRef): Promise<ParsedTranscript> {
+  return ref.kind === "codex" ? parseCodexTranscript(ref.path) : parseTranscript(ref.path);
 }
