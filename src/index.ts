@@ -194,7 +194,7 @@ async function runServer(): Promise<void> {
   log(`MCP server running. Logs: ${LOG_FILE}`);
 }
 
-const HELP = `clancey — provenance capture for Claude Code conversations
+const HELP = `clancey — a memory for your Claude Code conversations
 
 Usage:
   clancey                 Start the MCP server over stdio (how Claude Code runs it)

@@ -37,8 +37,8 @@ function emitNudge(repo: string | null, branch: string | null, session: string):
 }
 
 /**
- * `clancey hook` — invoked by Claude Code hooks. Reads the hook JSON on stdin, captures
- * provenance for file/command tools, and (throttled) nudges the agent to record decisions.
+ * `clancey hook` — invoked by Claude Code hooks. Reads the hook JSON on stdin, records
+ * file/command events, and (throttled) nudges the agent to record decisions.
  * Must never throw or block: any failure exits 0 silently.
  */
 export async function runHook(): Promise<void> {

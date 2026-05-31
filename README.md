@@ -3,18 +3,9 @@
 [![CI](https://github.com/divmgl/clancey/actions/workflows/ci.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/ci.yml)
 [![Publish to npm](https://github.com/divmgl/clancey/actions/workflows/publish.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/publish.yml)
 
-An MCP server that captures **provenance** from your Claude Code conversations. Given a branch or a changed file, find the sessions that produced it, recall the decisions you made, and read the verbatim turns where you made them.
+Clancey is a memory for your AI coding sessions. As you work in Claude Code it records every file you edit and command you run — tagged to the repo and branch — and prompts the agent to write down the decisions it makes and why.
 
-Clancey is built for a deterministic question — *"which conversation produced this PR, and why did we do it this way?"* — not fuzzy recall. The mapping (branch/file → session) is exact; the reasoning is the LLM's job, captured as you work and read back on demand.
-
-## What it does
-
-- **Captures provenance deterministically.** A `PostToolUse` hook records every file edit and command, tagged with the repo and branch, as it happens. No re-indexing, no embeddings of raw transcripts.
-- **Records your decisions.** The hook reminds the agent to log significant decisions (`record_decision`) with their rationale, anchored to the repo and branch.
-- **Maps PR → session.** `recall` answers "what work happened on this branch / to this file, and where do I read it" with an indexed SQL lookup.
-- **Searches decisions semantically.** `search` ranks recorded decisions and session framings by meaning — short, high-signal text, so a small local embedding model does the job well.
-- **Reads the verbatim turns.** `read_turns` returns what you actually said in a session, the deep dive that recovers a PR's motivation in your own words.
-- **Covers Codex too.** Existing Codex sessions (`~/.codex/sessions`) are backfilled — file edits (`apply_patch`), commands (`exec_command`/`shell`), branch, and turns. Codex has no hook, so it's backfill-only (no live capture or decision nudges).
+Later you just ask Claude in plain language — *"which conversation produced this PR, and why did we do it this way?"* — and it leverages Clancey to answer: mapping a branch or file back to the session that produced it (an exact, deterministic lookup), searching your past decisions by meaning, and reading back the exact turns where you made them. You don't call any of this directly; the agent does, through the MCP tools below.
 
 ## Prerequisites
 
@@ -22,7 +13,7 @@ Clancey is built for a deterministic question — *"which conversation produced 
 - **The `claude` CLI** — used by `setup` to register the MCP server (`claude mcp add`). If it's not on your `PATH`, setup prints the manual command to run.
 - A first run downloads the embedding model (`all-MiniLM-L6-v2`, ~30 MB), cached afterward.
 
-## Setup
+## Install and set up
 
 ```bash
 npx -y clancey setup
@@ -36,32 +27,25 @@ Non-interactive (also deletes the legacy index without asking):
 npx -y clancey setup --clean-legacy
 ```
 
-## The legacy v1 LanceDB index
+## What it does
 
-v0 (clancey ≤ 0.x) was a semantic-recall tool: it embedded raw 2000-char transcript chunks — **tool calls stripped** — into a LanceDB index at `~/.clancey/conversations.lance`. These indexes are large (tens of GB) and faulty, so `setup` offers to remove it once the new SQLite store is built. Nothing is ever deleted without your consent: an empty index dir (the published v0 server recreates one on every launch) is left untouched, and a non-empty one is only removed on confirmation or `--clean-legacy`.
-
-There is no automatic migration from the v0 index, by design. Because v0 stripped tool calls, its rows carry no file/branch provenance — the entire point of v1 — so a migrated session could never answer `recall`, only `search`/`read`. The only thing a migration would rescue is semantic search and verbatim text over conversations already **pruned off disk** by the 30-day retention window (see below); everything still on disk is backfilled properly, with provenance. If you want that history back, **keep the v0 index** (or a copy) instead of deleting it — the data is preserved so a pruned-only migration stays possible later. For most users it isn't worth it.
+- **Records your work deterministically.** A `PostToolUse` hook captures every file edit and command, tagged with the repo and branch, as it happens. No re-indexing, no embeddings of raw transcripts.
+- **Records your decisions.** The hook reminds the agent to log significant decisions (`record_decision`) with their rationale, anchored to the repo and branch.
+- **Maps PR → session.** `recall` answers "what work happened on this branch / to this file, and where do I read it" with an indexed SQL lookup.
+- **Searches decisions semantically.** `search` ranks recorded decisions and session framings by meaning — short, high-signal text, so a small local embedding model does the job well.
+- **Reads the verbatim turns.** `read_turns` returns what you actually said in a session, the deep dive that recovers a PR's motivation in your own words.
+- **Covers Codex too.** Existing Codex sessions (`~/.codex/sessions`) are backfilled — file edits (`apply_patch`), commands (`exec_command`/`shell`), branch, and turns. Codex has no hook, so it's backfill-only (no live capture or decision nudges).
 
 ## How it works
 
 1. A `PostToolUse` hook runs `clancey hook` after each `Edit`/`Write`/`Bash`. It resolves the repo (git top-level, shared across worktrees) and current branch, records the event, and — throttled — nudges the agent to call `record_decision` after significant decisions.
 2. A `SessionStart` hook injects the standing reminder to log decisions as you go.
-3. Everything is stored in one SQLite file at `~/.clancey/clancey.db`: an `events` table (provenance + decisions, indexed by repo/branch/file) and an `embeddings` table (decision and framing vectors).
+3. Everything is stored in one SQLite file at `~/.clancey/clancey.db`: an `events` table (work + decisions, indexed by repo/branch/file) and an `embeddings` table (decision and framing vectors).
 4. `clancey backfill` reads your existing Claude Code and Codex transcripts into the same store — every file edit becomes an event, and each session gets a framing embedding (its title + first message) so it is searchable even before any decision is recorded.
 
-## Retention — keep your transcripts
-
-Claude Code deletes chat transcripts after `cleanupPeriodDays` (**default 30**). Once a transcript is pruned, `read_turns` can no longer recover its verbatim turns — and any session older than the window is simply gone. clancey's own store is durable: the `events` and recorded `decisions` in `clancey.db` persist independently of pruning, so provenance and decisions survive. But to keep the *verbatim turns* available, raise the retention window in `~/.claude/settings.json`:
-
-```json
-{
-  "cleanupPeriodDays": 3650
-}
-```
-
-Do this early — pruned history can't be recovered. (clancey captures live going forward regardless, but it can only backfill transcripts that still exist on disk.)
-
 ## MCP tools
+
+The agent calls these; you reach them by asking Claude in natural language. The signatures are here for reference.
 
 ### `recall`
 
@@ -98,6 +82,18 @@ Record a decision and its rationale, anchored to the current repo and branch (pr
 record_decision({ repo, branch, decision, why })
 ```
 
+## Retention — keep your transcripts
+
+Claude Code deletes chat transcripts after `cleanupPeriodDays` (**default 30**). Once a transcript is pruned, `read_turns` can no longer recover its verbatim turns — and any session older than the window is simply gone. clancey's own store is durable: the `events` and recorded `decisions` in `clancey.db` persist independently of pruning, so your recorded work and decisions survive. But to keep the *verbatim turns* available, raise the retention window in `~/.claude/settings.json`:
+
+```json
+{
+  "cleanupPeriodDays": 3650
+}
+```
+
+Do this early — pruned history can't be recovered. (clancey captures live going forward regardless, but it can only backfill transcripts that still exist on disk.)
+
 ## Filling in decisions for past sessions
 
 History is indexed immediately, but old sessions have no recorded decisions — no agent was there to record them. Fill them in with a **host-agent pass**: ask Claude to walk your history using the tools above.
@@ -110,14 +106,16 @@ record_decision({ repo, branch, decision, why })  → write the synthesized deci
 
 After the pass, `recall` and `search` surface those decisions. Going forward, new sessions accrue decisions automatically via the hook.
 
-## CLI
+## Commands
+
+Clancey is an MCP server: running `clancey` bare starts the server over stdio, which is how Claude Code launches it. The binary also carries a thin operational CLI — of these, the only one you run by hand is `setup`.
 
 ```
-clancey            Start the MCP server (stdio)
-clancey setup      Wire hooks + MCP globally, clean legacy index, backfill
+clancey            Start the MCP server (stdio) — how Claude Code runs it
+clancey setup      Run once: wire hooks + MCP globally, clean legacy index, backfill
                    --clean-legacy / --yes   delete the v1 index non-interactively
-clancey hook       Invoked by Claude Code hooks (reads the event on stdin)
-clancey backfill   Ingest existing transcripts ( --force to re-ingest all )
+clancey hook       Invoked by Claude Code's hooks (reads the event on stdin)
+clancey backfill   Maintenance: ingest existing transcripts ( --force to re-ingest all )
 ```
 
 ## Storage

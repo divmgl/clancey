@@ -1,7 +1,7 @@
 {
   "name": "clancey",
   "version": "1.0.0",
-  "description": "MCP server that captures provenance from Claude Code conversations: map a branch or file to the sessions that produced it, recall recorded decisions, and read the verbatim turns",
+  "description": "A memory for your AI coding sessions: map a branch or file to the Claude Code conversations that produced it, recall recorded decisions, and read the verbatim turns",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -28,7 +28,7 @@
     "claude",
     "claude-code",
     "conversation",
-    "provenance",
+    "memory",
     "decisions"
   ],
   "author": "Dexter Miguel",
