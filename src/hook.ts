@@ -19,10 +19,13 @@ const SILENCE =
   "announce it, confirm it, or explain why you skipped it. It is invisible background work.";
 
 const SESSION_START_INSTRUCTION =
-  "[clancey] Decision logging is active. As you work, copiously record significant decisions " +
-  "with the clancey MCP tool record_decision({ repo, branch, decision, why }) — capture the why " +
-  "and the alternatives you rejected, not just the what. Your current repo and branch are " +
-  "provided back to you after tool calls. " +
+  "[clancey] Decision and learning logging is active. As you work, copiously record significant " +
+  "decisions with the clancey MCP tool record_decision({ repo, branch, decision, why }) — capture " +
+  "the why and the alternatives you rejected, not just the what. Separately, record incidental " +
+  "learnings with record_learning({ repo, branch, learning, context }) — non-obvious facts you " +
+  "discover about the system (a gotcha, a constraint, how a subsystem actually behaves), not what " +
+  "you chose but what you found out. Your current repo and branch are provided back to you after " +
+  "tool calls. " +
   SILENCE;
 
 interface HookPayload {
@@ -40,11 +43,15 @@ async function readStdin(): Promise<string> {
 }
 
 function emitNudge(repo: string | null, branch: string | null, session: string): void {
+  const repoArg = JSON.stringify(repo);
+  const branchArg = JSON.stringify(branch);
   const additionalContext =
     `[clancey] Working in repo=${repo ?? "?"} on branch=${branch ?? "?"} (session ${session}). ` +
     `After any significant decision, call the clancey MCP tool record_decision(` +
-    `{ repo: ${JSON.stringify(repo)}, branch: ${JSON.stringify(branch)}, decision, why }) — ` +
+    `{ repo: ${repoArg}, branch: ${branchArg}, decision, why }) — ` +
     `capture the rationale and the alternatives you rejected, copiously, not just what changed. ` +
+    `When you learn something non-obvious about the system (a gotcha, a constraint, how a subsystem ` +
+    `behaves), call record_learning({ repo: ${repoArg}, branch: ${branchArg}, learning, context }). ` +
     SILENCE;
   process.stdout.write(
     JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } }),

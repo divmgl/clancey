@@ -20,12 +20,16 @@ export interface ToolEventInput {
   ts: string;
 }
 
-export interface DecisionInput {
+/** The two kinds of note an agent records by hand: a decision, or an incidental learning. */
+export type NoteKind = "decision" | "learning";
+
+export interface NoteInput {
+  kind: NoteKind;
   session: string | null;
   repo: string | null;
   branch: string | null;
-  decision: string;
-  why: string | null;
+  body: string; // decision text, or the learning
+  detail: string | null; // the "why" of a decision, or the context of a learning
   files: string[] | null;
   ts: string;
 }
@@ -34,17 +38,18 @@ export interface EmbeddingInput {
   session: string;
   repo: string | null;
   branch: string | null;
-  kind: "decision" | "framing";
+  kind: NoteKind | "framing";
   text: string;
   vector: number[];
   ts: string;
   eventId?: number | null;
 }
 
-export interface StoredDecision {
+export interface StoredNote {
   id: number;
-  decision: string;
-  why: string | null;
+  kind: NoteKind;
+  body: string;
+  detail: string | null;
   repo: string | null;
   branch: string | null;
 }
@@ -68,6 +73,7 @@ export interface WorkItem {
   sessions: string[];
   files: string[];
   decisions: { id: number; decision: string; why: string | null; ts: string }[];
+  learnings: { id: number; learning: string; context: string | null; ts: string }[];
   firstTs: string;
   lastTs: string;
   toolEventCount: number;
@@ -181,14 +187,23 @@ export function insertToolEvent(db: Store, e: ToolEventInput): void {
   ).run(e);
 }
 
-/** Insert a decision event and return its id, so its embedding can link back to it. */
-export function insertDecision(db: Store, d: DecisionInput): number {
+/** Insert a note (decision or learning) and return its id, so its embedding can link back to it. */
+export function insertNote(db: Store, n: NoteInput): number {
   const info = db
     .prepare(
       `INSERT INTO events (ts, type, session, repo, branch, decision, why, files_json)
-       VALUES (@ts, 'decision', @session, @repo, @branch, @decision, @why, @files_json)`,
+       VALUES (@ts, @kind, @session, @repo, @branch, @body, @detail, @files_json)`,
     )
-    .run({ ...d, files_json: d.files ? JSON.stringify(d.files) : null });
+    .run({
+      ts: n.ts,
+      kind: n.kind,
+      session: n.session,
+      repo: n.repo,
+      branch: n.branch,
+      body: n.body,
+      detail: n.detail,
+      files_json: n.files ? JSON.stringify(n.files) : null,
+    });
   return Number(info.lastInsertRowid);
 }
 
@@ -199,56 +214,59 @@ export function insertEmbedding(db: Store, e: EmbeddingInput): void {
   ).run({ ...e, vector: vectorToBlob(e.vector), event_id: e.eventId ?? null });
 }
 
-/** The text stored on a decision's embedding row (the search-visible summary). */
-export function decisionText(decision: string, why: string | null): string {
-  return why ? `${decision} — ${why}` : decision;
+/** The text stored on a note's embedding row (the search-visible summary). */
+export function noteText(body: string, detail: string | null): string {
+  return detail ? `${body} — ${detail}` : body;
 }
 
-/** The text fed to the embedder for a decision (what `search` ranks against). */
-export function decisionEmbedInput(decision: string, why: string | null): string {
-  return why ? `${decision}\n\n${why}` : decision;
+/** The text fed to the embedder for a note (what `search` ranks against). */
+export function noteEmbedInput(body: string, detail: string | null): string {
+  return detail ? `${body}\n\n${detail}` : body;
 }
 
-export function getDecision(db: Store, id: number): StoredDecision | undefined {
-  return db
-    .prepare(`SELECT id, decision, why, repo, branch FROM events WHERE id = ? AND type = 'decision'`)
-    .get(id) as StoredDecision | undefined;
+export function getNote(db: Store, id: number): StoredNote | undefined {
+  const row = db
+    .prepare(`SELECT id, type, decision, why, repo, branch FROM events WHERE id = ? AND type IN ('decision', 'learning')`)
+    .get(id) as
+    | { id: number; type: NoteKind; decision: string; why: string | null; repo: string | null; branch: string | null }
+    | undefined;
+  return row ? { id: row.id, kind: row.type, body: row.decision, detail: row.why, repo: row.repo, branch: row.branch } : undefined;
 }
 
 /**
- * Delete a decision's embedding. New decisions link by event_id; decisions recorded before
- * that column existed are matched by their stored text (and repo/branch) instead.
+ * Delete a note's embedding. New notes link by event_id; notes recorded before
+ * that column existed are matched by their stored text (and kind/repo/branch) instead.
  */
-function removeDecisionEmbedding(db: Store, d: StoredDecision): void {
-  const byId = db.prepare(`DELETE FROM embeddings WHERE event_id = ?`).run(d.id);
+function removeNoteEmbedding(db: Store, n: StoredNote): void {
+  const byId = db.prepare(`DELETE FROM embeddings WHERE event_id = ?`).run(n.id);
   if (byId.changes > 0) return;
   db.prepare(
-    `DELETE FROM embeddings WHERE kind = 'decision' AND event_id IS NULL AND text = @text
-     AND ${eqOrNull("repo", d.repo, "repo")} AND ${eqOrNull("branch", d.branch, "branch")}`,
-  ).run({ text: decisionText(d.decision, d.why), repo: d.repo, branch: d.branch });
+    `DELETE FROM embeddings WHERE kind = @kind AND event_id IS NULL AND text = @text
+     AND ${eqOrNull("repo", n.repo, "repo")} AND ${eqOrNull("branch", n.branch, "branch")}`,
+  ).run({ kind: n.kind, text: noteText(n.body, n.detail), repo: n.repo, branch: n.branch });
 }
 
-/** Rewrite a decision and replace its embedding (caller supplies the new vector). */
-export function updateDecision(
+/** Rewrite a note and replace its embedding (caller supplies the new vector). */
+export function updateNote(
   db: Store,
   id: number,
-  next: { decision: string; why: string | null },
+  next: { body: string; detail: string | null },
   vector: number[],
 ): boolean {
-  const existing = getDecision(db, id);
+  const existing = getNote(db, id);
   if (!existing) return false;
-  removeDecisionEmbedding(db, existing);
-  db.prepare(`UPDATE events SET decision = @decision, why = @why WHERE id = @id`).run({
+  removeNoteEmbedding(db, existing);
+  db.prepare(`UPDATE events SET decision = @body, why = @detail WHERE id = @id`).run({
     id,
-    decision: next.decision,
-    why: next.why,
+    body: next.body,
+    detail: next.detail,
   });
   insertEmbedding(db, {
     session: "",
     repo: existing.repo,
     branch: existing.branch,
-    kind: "decision",
-    text: decisionText(next.decision, next.why),
+    kind: existing.kind,
+    text: noteText(next.body, next.detail),
     vector,
     ts: new Date().toISOString(),
     eventId: id,
@@ -256,12 +274,12 @@ export function updateDecision(
   return true;
 }
 
-/** Delete a decision and its embedding. Returns false if no such decision exists. */
-export function deleteDecision(db: Store, id: number): boolean {
-  const existing = getDecision(db, id);
+/** Delete a note and its embedding. Returns false if no such note exists. */
+export function deleteNote(db: Store, id: number): boolean {
+  const existing = getNote(db, id);
   if (!existing) return false;
-  removeDecisionEmbedding(db, existing);
-  db.prepare(`DELETE FROM events WHERE id = ? AND type = 'decision'`).run(id);
+  removeNoteEmbedding(db, existing);
+  db.prepare(`DELETE FROM events WHERE id = ? AND type IN ('decision', 'learning')`).run(id);
   return true;
 }
 
@@ -338,6 +356,7 @@ export function recall(
     const sessions = new Set<string>();
     const files = new Set<string>();
     const decisions: WorkItem["decisions"] = [];
+    const learnings: WorkItem["learnings"] = [];
     let toolEventCount = 0;
     for (const r of rows) {
       if (r.session) sessions.add(r.session);
@@ -346,6 +365,8 @@ export function recall(
         if (r.file) files.add(r.file);
       } else if (r.type === "decision" && r.decision) {
         decisions.push({ id: r.id, decision: r.decision, why: r.why, ts: r.ts });
+      } else if (r.type === "learning" && r.decision) {
+        learnings.push({ id: r.id, learning: r.decision, context: r.why, ts: r.ts });
       }
     }
     return {
@@ -354,6 +375,7 @@ export function recall(
       sessions: [...sessions],
       files: [...files],
       decisions,
+      learnings,
       firstTs: rows[0]?.ts ?? "",
       lastTs: rows[rows.length - 1]?.ts ?? "",
       toolEventCount,

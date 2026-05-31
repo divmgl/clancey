@@ -5,13 +5,13 @@ import fs from "fs";
 import {
   Store,
   openStore,
-  insertDecision,
+  insertNote,
   insertEmbedding,
-  getDecision,
-  updateDecision,
-  deleteDecision,
-  decisionText,
-  decisionEmbedInput,
+  getNote,
+  updateNote,
+  deleteNote,
+  noteText,
+  noteEmbedInput,
   recall,
   search,
   getTurns,
@@ -52,6 +52,12 @@ function formatWorkItems(items: WorkItem[]): string {
         lines.push(`- decisions:`);
         for (const d of w.decisions) {
           lines.push(`  - [#${d.id}] ${d.decision}${d.why ? ` — ${d.why}` : ""}`);
+        }
+      }
+      if (w.learnings.length) {
+        lines.push(`- learnings:`);
+        for (const l of w.learnings) {
+          lines.push(`  - [#${l.id}] ${l.learning}${l.context ? ` — ${l.context}` : ""}`);
         }
       }
       return lines.join("\n");
@@ -117,9 +123,51 @@ function buildServer(db: Store): Server {
         },
       },
       {
+        name: "record_learning",
+        description:
+          "Record an incidental learning — a non-obvious fact you discovered about the system (a gotcha, a constraint, how a subsystem actually behaves) — anchored to the current repo and branch. Record these copiously as you work, separate from decisions: not what you chose, but what you found out.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Repo key (provided in the clancey hook context)" },
+            branch: { type: "string", description: "Branch (provided in the clancey hook context)" },
+            learning: { type: "string", description: "What you learned" },
+            context: { type: "string", description: "Where it applies and why it matters" },
+            files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
+          },
+          required: ["learning"],
+        },
+      },
+      {
+        name: "update_learning",
+        description:
+          "Revise a recorded learning by its id (from recall). Pass the new learning and/or context; the embedding is re-generated so search reflects the edit. Use this to fix or rephrase a learning instead of recording a duplicate.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "Learning id, shown as [#id] in recall output" },
+            learning: { type: "string", description: "New learning text (omit to keep)" },
+            context: { type: "string", description: "New context (omit to keep)" },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "remove_learning",
+        description:
+          "Delete a recorded learning by its id (from recall), including its embedding. Use this to drop a wrong or duplicate learning so it stops surfacing in recall and search.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "Learning id, shown as [#id] in recall output" },
+          },
+          required: ["id"],
+        },
+      },
+      {
         name: "recall",
         description:
-          "Deterministically find the work (sessions, files, recorded decisions) for a branch, file, or repo. Use this to map a PR (its branch or changed files) to the sessions that produced it.",
+          "Deterministically find the work (sessions, files, recorded decisions and learnings) for a branch, file, or repo. Use this to map a PR (its branch or changed files) to the sessions that produced it.",
         inputSchema: {
           type: "object",
           properties: {
@@ -134,7 +182,7 @@ function buildServer(db: Store): Server {
       {
         name: "search",
         description:
-          "Semantic search over recorded decisions and session framings, ranked by similarity (descending). Use for the open case: 'what did I decide about X' when you don't know the branch.",
+          "Semantic search over recorded decisions, learnings, and session framings, ranked by similarity (descending). Use for the open case: 'what did I decide about X' or 'what did I learn about X' when you don't know the branch.",
         inputSchema: {
           type: "object",
           properties: {
@@ -172,28 +220,61 @@ function buildServer(db: Store): Server {
           const why = (args.why as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
-          const id = insertDecision(db, { session: null, repo, branch, decision, why, files, ts });
-          const vector = await embedOne(decisionEmbedInput(decision, why));
-          insertEmbedding(db, { session: "", repo, branch, kind: "decision", text: decisionText(decision, why), vector, ts, eventId: id });
+          const id = insertNote(db, { kind: "decision", session: null, repo, branch, body: decision, detail: why, files, ts });
+          const vector = await embedOne(noteEmbedInput(decision, why));
+          insertEmbedding(db, { session: "", repo, branch, kind: "decision", text: noteText(decision, why), vector, ts, eventId: id });
           return text(`Recorded decision #${id} on ${branch ?? "(no branch)"}.`);
         }
         case "update_decision": {
           const id = Number(args.id);
           if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
-          const existing = getDecision(db, id);
-          if (!existing) return { ...text(`No decision #${id} found.`), isError: true };
-          const decision = (args.decision as string | undefined) ?? existing.decision;
-          const why = args.why !== undefined ? (args.why as string | null) : existing.why;
-          const vector = await embedOne(decisionEmbedInput(decision, why));
-          updateDecision(db, id, { decision, why }, vector);
+          const existing = getNote(db, id);
+          if (!existing || existing.kind !== "decision") return { ...text(`No decision #${id} found.`), isError: true };
+          const decision = (args.decision as string | undefined) ?? existing.body;
+          const why = args.why !== undefined ? (args.why as string | null) : existing.detail;
+          const vector = await embedOne(noteEmbedInput(decision, why));
+          updateNote(db, id, { body: decision, detail: why }, vector);
           return text(`Updated decision #${id}.`);
         }
         case "remove_decision": {
           const id = Number(args.id);
           if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
-          return deleteDecision(db, id)
-            ? text(`Removed decision #${id}.`)
-            : { ...text(`No decision #${id} found.`), isError: true };
+          const existing = getNote(db, id);
+          if (!existing || existing.kind !== "decision") return { ...text(`No decision #${id} found.`), isError: true };
+          deleteNote(db, id);
+          return text(`Removed decision #${id}.`);
+        }
+        case "record_learning": {
+          const learning = args.learning as string;
+          if (!learning) return { ...text("Error: learning is required"), isError: true };
+          const repo = (args.repo as string) ?? null;
+          const branch = (args.branch as string) ?? null;
+          const context = (args.context as string) ?? null;
+          const files = (args.files as string[]) ?? null;
+          const ts = new Date().toISOString();
+          const id = insertNote(db, { kind: "learning", session: null, repo, branch, body: learning, detail: context, files, ts });
+          const vector = await embedOne(noteEmbedInput(learning, context));
+          insertEmbedding(db, { session: "", repo, branch, kind: "learning", text: noteText(learning, context), vector, ts, eventId: id });
+          return text(`Recorded learning #${id} on ${branch ?? "(no branch)"}.`);
+        }
+        case "update_learning": {
+          const id = Number(args.id);
+          if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
+          const existing = getNote(db, id);
+          if (!existing || existing.kind !== "learning") return { ...text(`No learning #${id} found.`), isError: true };
+          const learning = (args.learning as string | undefined) ?? existing.body;
+          const context = args.context !== undefined ? (args.context as string | null) : existing.detail;
+          const vector = await embedOne(noteEmbedInput(learning, context));
+          updateNote(db, id, { body: learning, detail: context }, vector);
+          return text(`Updated learning #${id}.`);
+        }
+        case "remove_learning": {
+          const id = Number(args.id);
+          if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
+          const existing = getNote(db, id);
+          if (!existing || existing.kind !== "learning") return { ...text(`No learning #${id} found.`), isError: true };
+          deleteNote(db, id);
+          return text(`Removed learning #${id}.`);
         }
         case "recall": {
           const items = recall(db, {

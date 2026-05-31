@@ -8,7 +8,7 @@ import {
   Store,
   openStore,
   insertToolEvent,
-  insertDecision,
+  insertNote,
   insertEmbedding,
   recall,
   search,
@@ -17,10 +17,10 @@ import {
   insertTurn,
   getTurns,
   deleteSession,
-  getDecision,
-  updateDecision,
-  deleteDecision,
-  decisionText,
+  getNote,
+  updateNote,
+  deleteNote,
+  noteText,
 } from "../src/store.ts";
 
 let dbPath: string;
@@ -51,17 +51,28 @@ function tool(over: Partial<Parameters<typeof insertToolEvent>[1]> = {}) {
 }
 
 describe("recall", () => {
-  test("groups events by (repo, branch) with files, sessions, and decisions", () => {
+  test("groups events by (repo, branch) with files, sessions, decisions, and learnings", () => {
     tool({ file: "/repo/src/a.ts", ts: "2026-01-01T00:00:01Z" });
     tool({ file: "/repo/src/b.ts", session: "s2", ts: "2026-01-01T00:00:02Z" });
-    const decisionId = insertDecision(db, {
+    const decisionId = insertNote(db, {
+      kind: "decision",
       session: "s1",
       repo: "/repo",
       branch: "feature/x",
-      decision: "Split auth module",
-      why: "It was tangled",
+      body: "Split auth module",
+      detail: "It was tangled",
       files: ["/repo/src/a.ts"],
       ts: "2026-01-01T00:00:03Z",
+    });
+    const learningId = insertNote(db, {
+      kind: "learning",
+      session: "s1",
+      repo: "/repo",
+      branch: "feature/x",
+      body: "Sessions are cookie-bound",
+      detail: "The refresh token lives in an httpOnly cookie",
+      files: null,
+      ts: "2026-01-01T00:00:04Z",
     });
 
     const items = recall(db, { branch: "feature/x" });
@@ -73,6 +84,14 @@ describe("recall", () => {
     assert.equal(w.toolEventCount, 2);
     assert.deepEqual(w.decisions, [
       { id: decisionId, decision: "Split auth module", why: "It was tangled", ts: "2026-01-01T00:00:03Z" },
+    ]);
+    assert.deepEqual(w.learnings, [
+      {
+        id: learningId,
+        learning: "Sessions are cookie-bound",
+        context: "The refresh token lives in an httpOnly cookie",
+        ts: "2026-01-01T00:00:04Z",
+      },
     ]);
   });
 
@@ -172,15 +191,15 @@ describe("schema migration", () => {
   });
 });
 
-describe("decision editing", () => {
-  function record(decision: string, why: string | null, eventLinked: boolean): number {
-    const id = insertDecision(db, { session: null, repo: "/r", branch: "b", decision, why, files: null, ts: "t" });
+describe("note editing", () => {
+  function record(kind: "decision" | "learning", body: string, detail: string | null, eventLinked: boolean): number {
+    const id = insertNote(db, { kind, session: null, repo: "/r", branch: "b", body, detail, files: null, ts: "t" });
     insertEmbedding(db, {
       session: "",
       repo: "/r",
       branch: "b",
-      kind: "decision",
-      text: decisionText(decision, why),
+      kind,
+      text: noteText(body, detail),
       vector: [1, 0],
       ts: "t",
       eventId: eventLinked ? id : null,
@@ -188,37 +207,48 @@ describe("decision editing", () => {
     return id;
   }
 
-  function decisionEmbeddings(): { text: string }[] {
-    return db.prepare(`SELECT text FROM embeddings WHERE kind = 'decision'`).all() as { text: string }[];
+  function embeddings(kind: "decision" | "learning"): { text: string }[] {
+    return db.prepare(`SELECT text FROM embeddings WHERE kind = ?`).all(kind) as { text: string }[];
   }
 
-  test("insertDecision returns an id that getDecision resolves", () => {
-    const id = record("D", "W", true);
-    assert.deepEqual(getDecision(db, id), { id, decision: "D", why: "W", repo: "/r", branch: "b" });
+  test("insertNote returns an id that getNote resolves with its kind", () => {
+    const id = record("decision", "D", "W", true);
+    assert.deepEqual(getNote(db, id), { id, kind: "decision", body: "D", detail: "W", repo: "/r", branch: "b" });
   });
 
-  test("updateDecision rewrites the event and replaces the linked embedding", () => {
-    const id = record("old", "oldwhy", true);
-    assert.equal(updateDecision(db, id, { decision: "new", why: "newwhy" }, [0, 1]), true);
-    assert.equal(getDecision(db, id)?.decision, "new");
-    assert.deepEqual(decisionEmbeddings(), [{ text: "new — newwhy" }]);
+  test("getNote reports the learning kind", () => {
+    const id = record("learning", "L", "C", true);
+    assert.deepEqual(getNote(db, id), { id, kind: "learning", body: "L", detail: "C", repo: "/r", branch: "b" });
   });
 
-  test("deleteDecision removes the event and its embedding", () => {
-    const id = record("D", "W", true);
-    assert.equal(deleteDecision(db, id), true);
-    assert.equal(getDecision(db, id), undefined);
-    assert.equal(decisionEmbeddings().length, 0);
+  test("updateNote rewrites the event and replaces the linked embedding", () => {
+    const id = record("decision", "old", "oldwhy", true);
+    assert.equal(updateNote(db, id, { body: "new", detail: "newwhy" }, [0, 1]), true);
+    assert.equal(getNote(db, id)?.body, "new");
+    assert.deepEqual(embeddings("decision"), [{ text: "new — newwhy" }]);
+  });
+
+  test("updateNote on a learning keeps its kind embedding", () => {
+    const id = record("learning", "old", null, true);
+    assert.equal(updateNote(db, id, { body: "new", detail: "ctx" }, [0, 1]), true);
+    assert.deepEqual(embeddings("learning"), [{ text: "new — ctx" }]);
+  });
+
+  test("deleteNote removes the event and its embedding", () => {
+    const id = record("decision", "D", "W", true);
+    assert.equal(deleteNote(db, id), true);
+    assert.equal(getNote(db, id), undefined);
+    assert.equal(embeddings("decision").length, 0);
   });
 
   test("removes a legacy embedding linked only by text (event_id null)", () => {
-    const id = record("D", "W", false);
-    assert.equal(deleteDecision(db, id), true);
-    assert.equal(decisionEmbeddings().length, 0);
+    const id = record("decision", "D", "W", false);
+    assert.equal(deleteNote(db, id), true);
+    assert.equal(embeddings("decision").length, 0);
   });
 
   test("returns false for a missing id", () => {
-    assert.equal(deleteDecision(db, 999), false);
-    assert.equal(updateDecision(db, 999, { decision: "x", why: null }, [0, 1]), false);
+    assert.equal(deleteNote(db, 999), false);
+    assert.equal(updateNote(db, 999, { body: "x", detail: null }, [0, 1]), false);
   });
 });
