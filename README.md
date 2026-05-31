@@ -34,15 +34,14 @@ Codex works too, with one difference: Clancey imports your Codex history and ans
 
 ## Keep your history
 
-Claude Code deletes chat transcripts after 30 days by default. Once a conversation is pruned, its original turns are gone for good. Clancey's own record of your work and decisions survives, but to keep the conversations themselves readable, raise the limit in `~/.claude/settings.json`:
-
-```json
-{
-  "cleanupPeriodDays": 3650
-}
-```
-
-Do this early. Pruned history can't be recovered.
+> [!IMPORTANT]
+> Claude Code deletes chat transcripts after 30 days by default. Once a conversation is pruned, its original turns are gone for good, so do this early. Clancey's own record of your work and decisions survives, but to keep the conversations themselves readable, raise the limit in `~/.claude/settings.json`:
+>
+> ```json
+> {
+>   "cleanupPeriodDays": 3650
+> }
+> ```
 
 ## Commands
 
