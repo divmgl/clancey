@@ -38,6 +38,15 @@ export interface EmbeddingInput {
   text: string;
   vector: number[];
   ts: string;
+  eventId?: number | null;
+}
+
+export interface StoredDecision {
+  id: number;
+  decision: string;
+  why: string | null;
+  repo: string | null;
+  branch: string | null;
 }
 
 export interface TurnInput {
@@ -58,7 +67,7 @@ export interface WorkItem {
   branch: string | null;
   sessions: string[];
   files: string[];
-  decisions: { decision: string; why: string | null; ts: string }[];
+  decisions: { id: number; decision: string; why: string | null; ts: string }[];
   firstTs: string;
   lastTs: string;
   toolEventCount: number;
@@ -104,14 +113,15 @@ function migrate(db: Store): void {
     CREATE INDEX IF NOT EXISTS idx_events_file ON events(file);
 
     CREATE TABLE IF NOT EXISTS embeddings (
-      id      INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts      TEXT NOT NULL,
-      session TEXT,
-      repo    TEXT,
-      branch  TEXT,
-      kind    TEXT NOT NULL,               -- 'decision' | 'framing'
-      text    TEXT NOT NULL,
-      vector  BLOB NOT NULL
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts       TEXT NOT NULL,
+      session  TEXT,
+      repo     TEXT,
+      branch   TEXT,
+      kind     TEXT NOT NULL,              -- 'decision' | 'framing'
+      text     TEXT NOT NULL,
+      vector   BLOB NOT NULL,
+      event_id INTEGER                     -- decision rows: the events.id they embed
     );
     CREATE INDEX IF NOT EXISTS idx_embeddings_session ON embeddings(session);
 
@@ -140,6 +150,16 @@ function migrate(db: Store): void {
       value TEXT NOT NULL
     );
   `);
+
+  addColumnIfMissing(db, "embeddings", "event_id", "INTEGER");
+}
+
+/** Additive schema upgrade for dbs created before a column existed. */
+function addColumnIfMissing(db: Store, table: string, column: string, decl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
 }
 
 export function getMeta(db: Store, key: string): string | undefined {
@@ -161,18 +181,88 @@ export function insertToolEvent(db: Store, e: ToolEventInput): void {
   ).run(e);
 }
 
-export function insertDecision(db: Store, d: DecisionInput): void {
-  db.prepare(
-    `INSERT INTO events (ts, type, session, repo, branch, decision, why, files_json)
-     VALUES (@ts, 'decision', @session, @repo, @branch, @decision, @why, @files_json)`,
-  ).run({ ...d, files_json: d.files ? JSON.stringify(d.files) : null });
+/** Insert a decision event and return its id, so its embedding can link back to it. */
+export function insertDecision(db: Store, d: DecisionInput): number {
+  const info = db
+    .prepare(
+      `INSERT INTO events (ts, type, session, repo, branch, decision, why, files_json)
+       VALUES (@ts, 'decision', @session, @repo, @branch, @decision, @why, @files_json)`,
+    )
+    .run({ ...d, files_json: d.files ? JSON.stringify(d.files) : null });
+  return Number(info.lastInsertRowid);
 }
 
 export function insertEmbedding(db: Store, e: EmbeddingInput): void {
   db.prepare(
-    `INSERT INTO embeddings (ts, session, repo, branch, kind, text, vector)
-     VALUES (@ts, @session, @repo, @branch, @kind, @text, @vector)`,
-  ).run({ ...e, vector: vectorToBlob(e.vector) });
+    `INSERT INTO embeddings (ts, session, repo, branch, kind, text, vector, event_id)
+     VALUES (@ts, @session, @repo, @branch, @kind, @text, @vector, @event_id)`,
+  ).run({ ...e, vector: vectorToBlob(e.vector), event_id: e.eventId ?? null });
+}
+
+/** The text stored on a decision's embedding row (the search-visible summary). */
+export function decisionText(decision: string, why: string | null): string {
+  return why ? `${decision} — ${why}` : decision;
+}
+
+/** The text fed to the embedder for a decision (what `search` ranks against). */
+export function decisionEmbedInput(decision: string, why: string | null): string {
+  return why ? `${decision}\n\n${why}` : decision;
+}
+
+export function getDecision(db: Store, id: number): StoredDecision | undefined {
+  return db
+    .prepare(`SELECT id, decision, why, repo, branch FROM events WHERE id = ? AND type = 'decision'`)
+    .get(id) as StoredDecision | undefined;
+}
+
+/**
+ * Delete a decision's embedding. New decisions link by event_id; decisions recorded before
+ * that column existed are matched by their stored text (and repo/branch) instead.
+ */
+function removeDecisionEmbedding(db: Store, d: StoredDecision): void {
+  const byId = db.prepare(`DELETE FROM embeddings WHERE event_id = ?`).run(d.id);
+  if (byId.changes > 0) return;
+  db.prepare(
+    `DELETE FROM embeddings WHERE kind = 'decision' AND event_id IS NULL AND text = @text
+     AND ${eqOrNull("repo", d.repo, "repo")} AND ${eqOrNull("branch", d.branch, "branch")}`,
+  ).run({ text: decisionText(d.decision, d.why), repo: d.repo, branch: d.branch });
+}
+
+/** Rewrite a decision and replace its embedding (caller supplies the new vector). */
+export function updateDecision(
+  db: Store,
+  id: number,
+  next: { decision: string; why: string | null },
+  vector: number[],
+): boolean {
+  const existing = getDecision(db, id);
+  if (!existing) return false;
+  removeDecisionEmbedding(db, existing);
+  db.prepare(`UPDATE events SET decision = @decision, why = @why WHERE id = @id`).run({
+    id,
+    decision: next.decision,
+    why: next.why,
+  });
+  insertEmbedding(db, {
+    session: "",
+    repo: existing.repo,
+    branch: existing.branch,
+    kind: "decision",
+    text: decisionText(next.decision, next.why),
+    vector,
+    ts: new Date().toISOString(),
+    eventId: id,
+  });
+  return true;
+}
+
+/** Delete a decision and its embedding. Returns false if no such decision exists. */
+export function deleteDecision(db: Store, id: number): boolean {
+  const existing = getDecision(db, id);
+  if (!existing) return false;
+  removeDecisionEmbedding(db, existing);
+  db.prepare(`DELETE FROM events WHERE id = ? AND type = 'decision'`).run(id);
+  return true;
 }
 
 /** Snapshot a human turn so read_turns survives transcript pruning. */
@@ -188,6 +278,7 @@ export function getTurns(db: Store, session: string, branch?: string): StoredTur
 }
 
 interface EventRow {
+  id: number;
   ts: string;
   type: string;
   session: string | null;
@@ -254,7 +345,7 @@ export function recall(
         toolEventCount++;
         if (r.file) files.add(r.file);
       } else if (r.type === "decision" && r.decision) {
-        decisions.push({ decision: r.decision, why: r.why, ts: r.ts });
+        decisions.push({ id: r.id, decision: r.decision, why: r.why, ts: r.ts });
       }
     }
     return {

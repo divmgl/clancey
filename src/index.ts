@@ -7,6 +7,11 @@ import {
   openStore,
   insertDecision,
   insertEmbedding,
+  getDecision,
+  updateDecision,
+  deleteDecision,
+  decisionText,
+  decisionEmbedInput,
   recall,
   search,
   getTurns,
@@ -46,7 +51,7 @@ function formatWorkItems(items: WorkItem[]): string {
       if (w.decisions.length) {
         lines.push(`- decisions:`);
         for (const d of w.decisions) {
-          lines.push(`  - ${d.decision}${d.why ? ` — ${d.why}` : ""}`);
+          lines.push(`  - [#${d.id}] ${d.decision}${d.why ? ` — ${d.why}` : ""}`);
         }
       }
       return lines.join("\n");
@@ -83,6 +88,32 @@ function buildServer(db: Store): Server {
             files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
           },
           required: ["decision"],
+        },
+      },
+      {
+        name: "update_decision",
+        description:
+          "Revise a recorded decision by its id (from recall). Pass the new decision and/or why; the embedding is re-generated so search reflects the edit. Use this to fix or rephrase a decision instead of recording a duplicate.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "Decision id, shown as [#id] in recall output" },
+            decision: { type: "string", description: "New decision text (omit to keep)" },
+            why: { type: "string", description: "New rationale (omit to keep)" },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "remove_decision",
+        description:
+          "Delete a recorded decision by its id (from recall), including its embedding. Use this to drop a wrong or duplicate decision so it stops surfacing in recall and search.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "Decision id, shown as [#id] in recall output" },
+          },
+          required: ["id"],
         },
       },
       {
@@ -141,10 +172,28 @@ function buildServer(db: Store): Server {
           const why = (args.why as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
-          insertDecision(db, { session: null, repo, branch, decision, why, files, ts });
-          const vector = await embedOne(why ? `${decision}\n\n${why}` : decision);
-          insertEmbedding(db, { session: "", repo, branch, kind: "decision", text: why ? `${decision} — ${why}` : decision, vector, ts });
-          return text(`Recorded decision on ${branch ?? "(no branch)"}.`);
+          const id = insertDecision(db, { session: null, repo, branch, decision, why, files, ts });
+          const vector = await embedOne(decisionEmbedInput(decision, why));
+          insertEmbedding(db, { session: "", repo, branch, kind: "decision", text: decisionText(decision, why), vector, ts, eventId: id });
+          return text(`Recorded decision #${id} on ${branch ?? "(no branch)"}.`);
+        }
+        case "update_decision": {
+          const id = Number(args.id);
+          if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
+          const existing = getDecision(db, id);
+          if (!existing) return { ...text(`No decision #${id} found.`), isError: true };
+          const decision = (args.decision as string | undefined) ?? existing.decision;
+          const why = args.why !== undefined ? (args.why as string | null) : existing.why;
+          const vector = await embedOne(decisionEmbedInput(decision, why));
+          updateDecision(db, id, { decision, why }, vector);
+          return text(`Updated decision #${id}.`);
+        }
+        case "remove_decision": {
+          const id = Number(args.id);
+          if (!Number.isInteger(id)) return { ...text("Error: id (integer) is required"), isError: true };
+          return deleteDecision(db, id)
+            ? text(`Removed decision #${id}.`)
+            : { ...text(`No decision #${id} found.`), isError: true };
         }
         case "recall": {
           const items = recall(db, {

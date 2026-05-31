@@ -28,7 +28,7 @@ You never call Clancey directly. Claude does, whenever you ask it about past wor
 - *"Why did we move auth to the edge?"*
 - *"What was I thinking the last time I changed `GameRepository.ts`?"*
 
-As you work, Claude records the decisions it makes so they're searchable later. You can also ask it to go back through your older sessions and fill in the decisions it finds, so even history from before you installed Clancey becomes useful.
+As you work, Claude records the decisions it makes so they're searchable later, and can revise or drop one when it was wrong or duplicated. You can also ask it to go back through your older sessions and fill in the decisions it finds, so even history from before you installed Clancey becomes useful.
 
 Codex works too, with one difference: Clancey imports your Codex history and answers from inside Codex, but it only records live as you work in Claude Code.
 
