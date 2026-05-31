@@ -134,7 +134,24 @@ function migrate(db: Store): void {
       path     TEXT PRIMARY KEY,
       mtime_ms REAL NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
+}
+
+export function getMeta(db: Store, key: string): string | undefined {
+  const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setMeta(db: Store, key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(key, value);
 }
 
 export function insertToolEvent(db: Store, e: ToolEventInput): void {

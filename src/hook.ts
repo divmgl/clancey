@@ -1,6 +1,15 @@
+import fs from "fs";
 import { repoKey, currentBranch } from "./git.js";
 import { openStore, insertToolEvent, getNudgeState, setNudgeState } from "./store.js";
+import { upgradeNotice } from "./upgrade.js";
 import { logError } from "./logger.js";
+
+function currentVersion(): string {
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
+    version: string;
+  };
+  return pkg.version;
+}
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const NUDGE_INTERVAL_MS = 10 * 60 * 1000;
@@ -56,7 +65,28 @@ export async function runHook(): Promise<void> {
   }
 
   if (payload.hook_event_name === "SessionStart") {
-    process.stdout.write(SESSION_START_INSTRUCTION);
+    let systemMessage: string | null = null;
+    try {
+      const db = openStore();
+      try {
+        systemMessage = await upgradeNotice(db, currentVersion());
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      logError("upgrade check failed", err);
+    }
+    const output: {
+      hookSpecificOutput: { hookEventName: string; additionalContext: string };
+      systemMessage?: string;
+    } = {
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: SESSION_START_INSTRUCTION,
+      },
+    };
+    if (systemMessage) output.systemMessage = systemMessage;
+    process.stdout.write(JSON.stringify(output));
     return;
   }
   if (payload.hook_event_name !== "PostToolUse") return;
