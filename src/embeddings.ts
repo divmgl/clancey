@@ -1,4 +1,3 @@
-import { pipeline } from "@huggingface/transformers";
 import { log, logError } from "./logger.js";
 
 const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
@@ -14,9 +13,14 @@ async function getExtractor() {
 
   if (!initPromise) {
     log(`Loading embedding model ${EMBEDDING_MODEL}...`);
-    initPromise = pipeline("feature-extraction", EMBEDDING_MODEL, {
-      dtype: "q8", // 8-bit quantization for smaller size
-    });
+    // Imported lazily: @huggingface/transformers pulls in heavy native deps (onnxruntime,
+    // sharp) at load. Only the embedding paths need them — the hook, recall, grep_turns and
+    // read_turns must not drag the model (or a broken sharp binary) into their import chain.
+    initPromise = import("@huggingface/transformers").then(({ pipeline }) =>
+      pipeline("feature-extraction", EMBEDDING_MODEL, {
+        dtype: "q8", // 8-bit quantization for smaller size
+      }),
+    );
   }
 
   extractor = await initPromise;
