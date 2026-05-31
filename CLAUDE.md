@@ -2,7 +2,14 @@
 
 A memory for AI coding sessions. An MCP server (plus a thin operational CLI) that records what Claude Code / Codex sessions did and the decisions made, so the agent can map a branch or file back to the conversation that produced it.
 
-## Releasing — you MUST bump the version to publish
+## Releasing — manual only, never aggressive
+
+**Do NOT push a version bump to `main` on your own.** A push to `main` that changes
+`package.json` version publishes to npm automatically — there is no second gate. So bumping the
+version as part of normal work ships an unreviewed release to every user. Only cut a release
+when explicitly asked, and do it through the `/release` command (`.claude/commands/release.md`),
+which runs the standardized steps. Land fixes and features on `main` **without** touching
+`version`; the version stays put until a deliberate release.
 
 Publishing to npm is automated by `.github/workflows/publish.yml` on every push to `main`. It is **driven by a version change, not by code changes**:
 
