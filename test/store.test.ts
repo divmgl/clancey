@@ -216,9 +216,26 @@ describe("nudge state", () => {
   test("upserts last branch and nudge timestamp", () => {
     assert.equal(getNudgeState(db, "s1"), undefined);
     setNudgeState(db, "s1", "feature/x", "2026-01-01T00:00:00Z");
-    assert.deepEqual(getNudgeState(db, "s1"), { last_branch: "feature/x", last_nudge_ts: "2026-01-01T00:00:00Z" });
+    assert.deepEqual(getNudgeState(db, "s1"), {
+      last_branch: "feature/x",
+      last_nudge_ts: "2026-01-01T00:00:00Z",
+      last_event_ts: null,
+    });
     setNudgeState(db, "s1", "feature/y", "2026-01-01T01:00:00Z");
-    assert.deepEqual(getNudgeState(db, "s1"), { last_branch: "feature/y", last_nudge_ts: "2026-01-01T01:00:00Z" });
+    assert.deepEqual(getNudgeState(db, "s1"), {
+      last_branch: "feature/y",
+      last_nudge_ts: "2026-01-01T01:00:00Z",
+      last_event_ts: null,
+    });
+  });
+
+  test("records an event timestamp independently of the generic nudge timestamp", () => {
+    setNudgeState(db, "s1", "feature/x", "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
+    assert.deepEqual(getNudgeState(db, "s1"), {
+      last_branch: "feature/x",
+      last_nudge_ts: "2026-01-01T00:00:00Z",
+      last_event_ts: "2026-01-01T00:05:00Z",
+    });
   });
 });
 

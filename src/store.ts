@@ -168,6 +168,7 @@ function migrate(db: Store): void {
   `);
 
   addColumnIfMissing(db, "embeddings", "event_id", "INTEGER");
+  addColumnIfMissing(db, "state", "last_event_ts", "TEXT");
   backfillTurnsFts(db);
 }
 
@@ -472,19 +473,28 @@ export function search(db: Store, queryVector: number[], limit = 8): SearchHit[]
 export interface NudgeState {
   last_branch: string | null;
   last_nudge_ts: string | null;
+  /** When an event-specific nudge (commit/PR/push) last fired — its own cooldown clock. */
+  last_event_ts: string | null;
 }
 
 export function getNudgeState(db: Store, session: string): NudgeState | undefined {
   return db
-    .prepare(`SELECT last_branch, last_nudge_ts FROM state WHERE session = ?`)
+    .prepare(`SELECT last_branch, last_nudge_ts, last_event_ts FROM state WHERE session = ?`)
     .get(session) as NudgeState | undefined;
 }
 
-export function setNudgeState(db: Store, session: string, branch: string | null, ts: string): void {
+export function setNudgeState(
+  db: Store,
+  session: string,
+  branch: string | null,
+  ts: string,
+  eventTs: string | null = null,
+): void {
   db.prepare(
-    `INSERT INTO state (session, last_branch, last_nudge_ts) VALUES (@session, @branch, @ts)
-     ON CONFLICT(session) DO UPDATE SET last_branch = @branch, last_nudge_ts = @ts`,
-  ).run({ session, branch, ts });
+    `INSERT INTO state (session, last_branch, last_nudge_ts, last_event_ts)
+     VALUES (@session, @branch, @ts, @eventTs)
+     ON CONFLICT(session) DO UPDATE SET last_branch = @branch, last_nudge_ts = @ts, last_event_ts = @eventTs`,
+  ).run({ session, branch, ts, eventTs });
 }
 
 /** Cumulative counts across everything ingested (not just the last backfill). */

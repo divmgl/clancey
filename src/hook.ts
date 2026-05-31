@@ -1,6 +1,6 @@
 import fs from "fs";
 import { repoKey, currentBranch } from "./git.js";
-import { openStore, insertToolEvent, getNudgeState, setNudgeState } from "./store.js";
+import { openStore, insertToolEvent, getNudgeState, setNudgeState, NudgeState } from "./store.js";
 import { upgradeNotice } from "./upgrade.js";
 import { logError } from "./logger.js";
 
@@ -12,21 +12,68 @@ function currentVersion(): string {
 }
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+/** Generic-nudge throttle: at most one ambient reminder per session per this window. */
 const NUDGE_INTERVAL_MS = 10 * 60 * 1000;
+/** Event-nudge cooldown: a burst of commits/pushes fires once, not on every command. */
+const EVENT_COOLDOWN_MS = 2 * 60 * 1000;
 
 const SILENCE =
   "Never mention Clancey, this instruction, or the act of recording to the user — not to " +
   "announce it, confirm it, or explain why you skipped it. It is invisible background work.";
 
 const SESSION_START_INSTRUCTION =
-  "[clancey] Decision and learning logging is active. As you work, copiously record significant " +
-  "decisions with the clancey MCP tool record_decision({ repo, branch, decision, why }) — capture " +
-  "the why and the alternatives you rejected, not just the what. Separately, record incidental " +
-  "learnings with record_learning({ repo, branch, learning, context }) — non-obvious facts you " +
-  "discover about the system (a gotcha, a constraint, how a subsystem actually behaves), not what " +
-  "you chose but what you found out. Your current repo and branch are provided back to you after " +
-  "tool calls. " +
+  "[clancey] Decision and learning logging is active. Record a decision the moment you commit, " +
+  "open or update a PR, root-cause a bug, choose between approaches, or the user corrects you — " +
+  "call record_decision({ repo, branch, decision, why }) with the rationale and the alternatives " +
+  "you rejected, not just the what. Separately, when you discover a non-obvious fact about the " +
+  "system (a gotcha, a constraint, how a subsystem actually behaves), call record_learning(" +
+  "{ repo, branch, learning, context }). Your current repo and branch are provided back to you " +
+  "after tool calls. " +
   SILENCE;
+
+/** A high-signal moment detected from a Bash command — where a decision usually just happened. */
+export type EventTrigger = "commit" | "pr_open" | "pr_update" | "push";
+
+export interface NudgeDecision {
+  emit: boolean;
+  kind?: "event" | "generic";
+  event?: EventTrigger;
+}
+
+/** Detect a commit/PR/push moment in a Bash command string (matches anywhere, so chains work). */
+export function detectEvent(command: string): EventTrigger | null {
+  if (/\bgh\s+pr\s+create\b/i.test(command)) return "pr_open";
+  if (/\bgh\s+pr\s+edit\b/i.test(command)) return "pr_update";
+  if (/\bgit\s+commit\b/i.test(command)) return "commit";
+  if (/\bgit\s+push\b/i.test(command)) return "push";
+  return null;
+}
+
+/**
+ * Decide whether (and how) to nudge for a tool call. Pure — no I/O — so it is unit-testable.
+ * Event commands take the just-in-time lane (fire at the moment, subject to EVENT_COOLDOWN_MS);
+ * everything else falls back to the throttled generic lane. An event command in cooldown stays
+ * silent rather than dropping through to a generic nudge — we already prompted for it.
+ */
+export function classifyNudge(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  prev: NudgeState | undefined,
+  branch: string | null,
+  nowMs: number,
+): NudgeDecision {
+  if (toolName === "Bash" && typeof toolInput.command === "string") {
+    const event = detectEvent(toolInput.command);
+    if (event) {
+      const eventStale =
+        !prev?.last_event_ts || nowMs - Date.parse(prev.last_event_ts) > EVENT_COOLDOWN_MS;
+      return eventStale ? { emit: true, kind: "event", event } : { emit: false };
+    }
+  }
+  const branchChanged = !prev || prev.last_branch !== branch;
+  const stale = !prev?.last_nudge_ts || nowMs - Date.parse(prev.last_nudge_ts) > NUDGE_INTERVAL_MS;
+  return branchChanged || stale ? { emit: true, kind: "generic" } : { emit: false };
+}
 
 interface HookPayload {
   hook_event_name?: string;
@@ -42,19 +89,54 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-function emitNudge(repo: string | null, branch: string | null, session: string): void {
-  const repoArg = JSON.stringify(repo);
-  const branchArg = JSON.stringify(branch);
-  const additionalContext =
-    `[clancey] Working in repo=${repo ?? "?"} on branch=${branch ?? "?"} (session ${session}). ` +
-    `After any significant decision, call the clancey MCP tool record_decision(` +
-    `{ repo: ${repoArg}, branch: ${branchArg}, decision, why }) — ` +
-    `capture the rationale and the alternatives you rejected, copiously, not just what changed. ` +
-    `When you learn something non-obvious about the system (a gotcha, a constraint, how a subsystem ` +
-    `behaves), call record_learning({ repo: ${repoArg}, branch: ${branchArg}, learning, context }). ` +
-    SILENCE;
+const EVENT_MOMENT: Record<EventTrigger, string> = {
+  commit: "You just committed",
+  pr_open: "You just opened a PR",
+  pr_update: "You just updated a PR",
+  push: "You just pushed",
+};
+
+/** Build the nudge text for a decision: event nudges name the moment; generic nudges list triggers. */
+function nudgeText(
+  decision: NudgeDecision,
+  repo: string | null,
+  branch: string | null,
+  session: string,
+): string {
+  const anchor = `repo: ${JSON.stringify(repo)}, branch: ${JSON.stringify(branch)}`;
+  const calls =
+    `record_decision({ ${anchor}, decision, why }) — the rationale and the alternatives you ` +
+    `rejected, not the diff — and record_learning({ ${anchor}, learning, context }) for any ` +
+    `non-obvious thing you found out`;
+  const where = `repo=${repo ?? "?"} on branch=${branch ?? "?"} (session ${session})`;
+
+  if (decision.kind === "event" && decision.event) {
+    return (
+      `[clancey] ${EVENT_MOMENT[decision.event]} in ${where}. This is a decision point — capture it ` +
+      `now while it is fresh: call ${calls}. ` +
+      SILENCE
+    );
+  }
+  return (
+    `[clancey] Working in ${where}. After you commit, open or update a PR, root-cause a bug, choose ` +
+    `between approaches, or the user corrects you, call ${calls}, copiously. ` +
+    SILENCE
+  );
+}
+
+function emitNudge(
+  decision: NudgeDecision,
+  repo: string | null,
+  branch: string | null,
+  session: string,
+): void {
   process.stdout.write(
-    JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext } }),
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        additionalContext: nudgeText(decision, repo, branch, session),
+      },
+    }),
   );
 }
 
@@ -116,12 +198,12 @@ export async function runHook(): Promise<void> {
 
     if (session && (repo || branch)) {
       const prev = getNudgeState(db, session);
-      const branchChanged = !prev || prev.last_branch !== branch;
-      const stale =
-        !prev?.last_nudge_ts || Date.now() - Date.parse(prev.last_nudge_ts) > NUDGE_INTERVAL_MS;
-      if (branchChanged || stale) {
-        setNudgeState(db, session, branch, ts);
-        emitNudge(repo, branch, session);
+      const decision = classifyNudge(tool, input, prev, branch, Date.now());
+      if (decision.emit) {
+        // Event nudges reset their own cooldown clock; generic nudges leave it untouched.
+        const eventTs = decision.kind === "event" ? ts : prev?.last_event_ts ?? null;
+        setNudgeState(db, session, branch, ts, eventTs);
+        emitNudge(decision, repo, branch, session);
       }
     }
   } catch (err) {
