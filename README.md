@@ -35,7 +35,7 @@ Codex works too, with one difference: Clancey imports your Codex history and ans
 ## Keep your history
 
 > [!IMPORTANT]
-> Claude Code deletes chat transcripts after 30 days by default. Once a conversation is pruned, its original turns are gone for good, so do this early. Clancey's own record of your work and decisions survives, but to keep the conversations themselves readable, raise the limit in `~/.claude/settings.json`:
+> Claude Code deletes chat transcripts after 30 days by default, so do this early. Clancey snapshots the conversations it imports, so anything it has already seen survives pruning, but raising the window keeps conversations around long enough to be imported in the first place:
 >
 > ```json
 > {

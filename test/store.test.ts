@@ -13,6 +13,9 @@ import {
   search,
   getNudgeState,
   setNudgeState,
+  insertTurn,
+  getTurns,
+  deleteSession,
 } from "../src/store.ts";
 
 let dbPath: string;
@@ -97,6 +100,34 @@ describe("search", () => {
     insertEmbedding(db, { session: "s1", repo: null, branch: null, kind: "decision", text: "a", vector: [1, 0], ts: "t" });
     insertEmbedding(db, { session: "s2", repo: null, branch: null, kind: "decision", text: "b", vector: [0, 1], ts: "t" });
     assert.equal(search(db, [1, 0], 1).length, 1);
+  });
+});
+
+describe("turns", () => {
+  test("stores and returns turns in chronological order", () => {
+    insertTurn(db, { session: "s1", ts: "2026-01-01T00:00:02Z", branch: "feature/x", text: "second" });
+    insertTurn(db, { session: "s1", ts: "2026-01-01T00:00:01Z", branch: "feature/x", text: "first" });
+    assert.deepEqual(
+      getTurns(db, "s1").map((t) => t.text),
+      ["first", "second"],
+    );
+  });
+
+  test("filters by branch", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: "feature/x", text: "x turn" });
+    insertTurn(db, { session: "s1", ts: "t2", branch: "feature/y", text: "y turn" });
+    assert.deepEqual(
+      getTurns(db, "s1", "feature/y").map((t) => t.text),
+      ["y turn"],
+    );
+  });
+
+  test("deleteSession clears the session's turns", () => {
+    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "gone" });
+    insertTurn(db, { session: "s2", ts: "t1", branch: null, text: "kept" });
+    deleteSession(db, "s1");
+    assert.equal(getTurns(db, "s1").length, 0);
+    assert.equal(getTurns(db, "s2").length, 1);
   });
 });
 

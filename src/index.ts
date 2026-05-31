@@ -9,6 +9,7 @@ import {
   insertEmbedding,
   recall,
   search,
+  getTurns,
   storeTotals,
   WorkItem,
   SearchHit,
@@ -165,12 +166,27 @@ function buildServer(db: Store): Server {
           const session = args.session as string;
           if (!session) return { ...text("Error: session is required"), isError: true };
           const branch = args.branch as string | undefined;
+
+          // The live transcript is freshest; fall back to the stored snapshot once it is pruned.
+          let title: string | null = null;
+          let turns: { timestamp: string; text: string }[];
+          let pruned = false;
           const ref = await resolveSession(session);
-          if (!ref) return { ...text(`No transcript found for session ${session}`), isError: true };
-          const parsed = await parseAny(ref);
-          const turns = branch ? parsed.userTurns.filter((t) => t.branch === branch) : parsed.userTurns;
-          if (turns.length === 0) return text(`No human turns${branch ? ` on branch ${branch}` : ""} in session ${session}.`);
-          const header = `Session ${session}${branch ? ` (branch ${branch})` : ""} — ${turns.length} turns${parsed.title ? `\nTitle: ${parsed.title}` : ""}`;
+          if (ref) {
+            const parsed = await parseAny(ref);
+            title = parsed.title;
+            const filtered = branch ? parsed.userTurns.filter((t) => t.branch === branch) : parsed.userTurns;
+            turns = filtered.map((t) => ({ timestamp: t.timestamp, text: t.text }));
+          } else {
+            pruned = true;
+            turns = getTurns(db, session, branch).map((t) => ({ timestamp: t.ts, text: t.text }));
+          }
+
+          if (turns.length === 0) {
+            return text(`No human turns${branch ? ` on branch ${branch}` : ""} found for session ${session}.`);
+          }
+          const note = pruned ? "\n(transcript pruned; served from snapshot)" : "";
+          const header = `Session ${session}${branch ? ` (branch ${branch})` : ""} — ${turns.length} turns${title ? `\nTitle: ${title}` : ""}${note}`;
           const body = turns.map((t) => `--- ${t.timestamp} ---\n${t.text}`).join("\n\n");
           return text(`${header}\n\n${body}`);
         }

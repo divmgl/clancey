@@ -11,6 +11,7 @@ import {
   openStore,
   insertToolEvent,
   insertEmbedding,
+  insertTurn,
   setIngested,
   getIngestedMtime,
   deleteSession,
@@ -87,6 +88,9 @@ export async function backfill(
           ts: e.timestamp,
         });
         events++;
+      }
+      for (const u of parsed.userTurns) {
+        insertTurn(db, { session: parsed.sessionId, ts: u.timestamp, branch: u.branch, text: u.text });
       }
       if (framingVec && parsed.framing) {
         insertEmbedding(db, {

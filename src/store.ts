@@ -40,6 +40,19 @@ export interface EmbeddingInput {
   ts: string;
 }
 
+export interface TurnInput {
+  session: string;
+  ts: string;
+  branch: string | null;
+  text: string;
+}
+
+export interface StoredTurn {
+  ts: string;
+  branch: string | null;
+  text: string;
+}
+
 export interface WorkItem {
   repo: string | null;
   branch: string | null;
@@ -102,6 +115,15 @@ function migrate(db: Store): void {
     );
     CREATE INDEX IF NOT EXISTS idx_embeddings_session ON embeddings(session);
 
+    CREATE TABLE IF NOT EXISTS turns (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      session TEXT NOT NULL,
+      ts      TEXT NOT NULL,
+      branch  TEXT,
+      text    TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session);
+
     CREATE TABLE IF NOT EXISTS state (
       session       TEXT PRIMARY KEY,
       last_branch   TEXT,
@@ -134,6 +156,18 @@ export function insertEmbedding(db: Store, e: EmbeddingInput): void {
     `INSERT INTO embeddings (ts, session, repo, branch, kind, text, vector)
      VALUES (@ts, @session, @repo, @branch, @kind, @text, @vector)`,
   ).run({ ...e, vector: vectorToBlob(e.vector) });
+}
+
+/** Snapshot a human turn so read_turns survives transcript pruning. */
+export function insertTurn(db: Store, t: TurnInput): void {
+  db.prepare(`INSERT INTO turns (session, ts, branch, text) VALUES (@session, @ts, @branch, @text)`).run(t);
+}
+
+export function getTurns(db: Store, session: string, branch?: string): StoredTurn[] {
+  const clause = branch === undefined ? "" : " AND branch = @branch";
+  return db
+    .prepare(`SELECT ts, branch, text FROM turns WHERE session = @session${clause} ORDER BY ts, id`)
+    .all({ session, branch }) as StoredTurn[];
 }
 
 interface EventRow {
@@ -295,4 +329,5 @@ export function setIngested(db: Store, filePath: string, mtimeMs: number): void 
 export function deleteSession(db: Store, session: string): void {
   db.prepare(`DELETE FROM events WHERE session = ? AND type = 'tool'`).run(session);
   db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
+  db.prepare(`DELETE FROM turns WHERE session = ?`).run(session);
 }
