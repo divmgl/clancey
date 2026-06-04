@@ -11,14 +11,16 @@ import {
   openStore,
   insertToolEvent,
   insertEmbedding,
-  insertTurn,
+  insertMessage,
   setIngested,
   getIngestedMtime,
   deleteSession,
+  pruneOlderThan,
+  getRetentionDays,
   storeTotals,
   CLANCEY_DIR,
 } from "./store.js";
-import { listAllTranscripts, parseAny } from "./parser.js";
+import { listAllTranscripts, listSubagents, parseAny, parseSubagent, ParsedTranscript, SubagentRef } from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { repoKey } from "./git.js";
 import { setConsoleSilent } from "./logger.js";
@@ -59,12 +61,29 @@ export async function backfill(
 
   for (const ref of transcripts) {
     const file = ref.path;
-    const stat = await fs.promises.stat(file);
-    if (!opts.force && getIngestedMtime(db, file) === stat.mtimeMs) continue;
+
+    // A session and its subagents are one ingest unit: subagent turns fold under the parent
+    // session id, and deleteSession() wipes the whole unit before re-inserting. Gate on the
+    // newest mtime across the parent transcript and all its subagent files so a change to any
+    // of them re-ingests the unit and avoids partial folds.
+    const subRefs = ref.kind === "claude" ? await listSubagents(file) : [];
+    const unitFiles = [file, ...subRefs.map((s) => s.path)];
+    const mtimes = await Promise.all(unitFiles.map((f) => fs.promises.stat(f).then((s) => s.mtimeMs)));
+    const unitMtime = Math.max(...mtimes);
+    if (!opts.force && getIngestedMtime(db, file) === unitMtime) continue;
 
     const parsed = await parseAny(ref);
-    if (parsed.toolEvents.length === 0 && !parsed.framing) {
-      setIngested(db, file, stat.mtimeMs);
+    const subs: { ref: SubagentRef; parsed: ParsedTranscript }[] = await Promise.all(
+      subRefs.map(async (s) => ({ ref: s, parsed: await parseSubagent(s) })),
+    );
+
+    const hasContent =
+      parsed.toolEvents.length > 0 ||
+      parsed.framing !== null ||
+      parsed.messages.length > 0 ||
+      subs.some((s) => s.parsed.messages.length > 0 || s.parsed.toolEvents.length > 0);
+    if (!hasContent) {
+      setIngested(db, file, unitMtime);
       continue;
     }
 
@@ -76,22 +95,44 @@ export async function backfill(
 
     const apply = db.transaction(() => {
       deleteSession(db, parsed.sessionId);
-      for (const e of parsed.toolEvents) {
-        insertToolEvent(db, {
-          session: parsed.sessionId,
-          repo: resolveRepo(e.cwd),
-          branch: e.branch,
-          cwd: e.cwd,
-          tool: e.tool,
-          file: e.file,
-          command: e.command,
-          ts: e.timestamp,
-        });
-        events++;
+
+      const insertEvents = (p: ParsedTranscript, agent: string | null) => {
+        for (const e of p.toolEvents) {
+          insertToolEvent(db, {
+            session: parsed.sessionId,
+            repo: resolveRepo(e.cwd),
+            branch: e.branch,
+            cwd: e.cwd,
+            tool: e.tool,
+            file: e.file,
+            command: e.command,
+            ts: e.timestamp,
+            agent,
+          });
+          events++;
+        }
+      };
+      const insertMessages = (p: ParsedTranscript) => {
+        for (const m of p.messages) {
+          insertMessage(db, {
+            session: parsed.sessionId,
+            ts: m.timestamp,
+            branch: m.branch,
+            role: m.role,
+            agent: m.agent,
+            agentId: m.agentId,
+            text: m.text,
+          });
+        }
+      };
+
+      insertEvents(parsed, null);
+      insertMessages(parsed);
+      for (const s of subs) {
+        insertEvents(s.parsed, s.ref.agentType);
+        insertMessages(s.parsed);
       }
-      for (const u of parsed.userTurns) {
-        insertTurn(db, { session: parsed.sessionId, ts: u.timestamp, branch: u.branch, text: u.text });
-      }
+
       if (framingVec && parsed.framing) {
         insertEmbedding(db, {
           session: parsed.sessionId,
@@ -104,11 +145,14 @@ export async function backfill(
         });
         embeddings++;
       }
-      setIngested(db, file, stat.mtimeMs);
+      setIngested(db, file, unitMtime);
     });
     apply();
     sessions++;
   }
+
+  const retentionDays = getRetentionDays(db);
+  if (retentionDays > 0) pruneOlderThan(db, retentionDays);
 
   return { sessions, events, embeddings };
 }

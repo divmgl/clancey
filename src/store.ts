@@ -18,6 +18,8 @@ export interface ToolEventInput {
   file: string | null;
   command: string | null;
   ts: string;
+  /** Subagent type when this event came from a subagent transcript; null for the main session. */
+  agent?: string | null;
 }
 
 /** The two kinds of note an agent records by hand: a decision, or an incidental learning. */
@@ -54,16 +56,21 @@ export interface StoredNote {
   branch: string | null;
 }
 
-export interface TurnInput {
+export interface MessageInput {
   session: string;
   ts: string;
   branch: string | null;
+  role: "user" | "assistant";
+  agent: string | null;
+  agentId: string | null;
   text: string;
 }
 
-export interface StoredTurn {
+export interface StoredMessage {
   ts: string;
   branch: string | null;
+  role: "user" | "assistant";
+  agent: string | null;
   text: string;
 }
 
@@ -131,23 +138,30 @@ function migrate(db: Store): void {
     );
     CREATE INDEX IF NOT EXISTS idx_embeddings_session ON embeddings(session);
 
-    CREATE TABLE IF NOT EXISTS turns (
-      id      INTEGER PRIMARY KEY AUTOINCREMENT,
-      session TEXT NOT NULL,
-      ts      TEXT NOT NULL,
-      branch  TEXT,
-      text    TEXT NOT NULL
+    -- Full conversation: user + assistant turns (with verbatim scripts/code inline), plus
+    -- subagent turns folded under their parent session. This is what makes grep/read cover
+    -- what the agent actually did, not just what the human asked.
+    CREATE TABLE IF NOT EXISTS messages (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      session  TEXT NOT NULL,        -- parent session id (subagents fold in)
+      ts       TEXT NOT NULL,
+      branch   TEXT,
+      role     TEXT NOT NULL,        -- 'user' | 'assistant'
+      agent    TEXT,                 -- NULL = main session; else the subagent type
+      agent_id TEXT,
+      text     TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session);
+    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session);
 
-    -- Full-text index over verbatim turns: the keyword fallback for when semantic
-    -- search misses something said in passing. Metadata columns are UNINDEXED so
-    -- they ride along for results without being part of the match.
-    CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+    -- Keyword index over the full conversation. Metadata columns are UNINDEXED so they ride
+    -- along with results (role/agent attribution, snippet reconstruction) without being matched.
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       text,
-      session UNINDEXED,
-      ts      UNINDEXED,
-      branch  UNINDEXED
+      session  UNINDEXED,
+      ts       UNINDEXED,
+      branch   UNINDEXED,
+      role     UNINDEXED,
+      agent    UNINDEXED
     );
 
     CREATE TABLE IF NOT EXISTS state (
@@ -169,18 +183,23 @@ function migrate(db: Store): void {
 
   addColumnIfMissing(db, "embeddings", "event_id", "INTEGER");
   addColumnIfMissing(db, "state", "last_event_ts", "TEXT");
-  backfillTurnsFts(db);
+  addColumnIfMissing(db, "events", "agent", "TEXT");
+  backfillMessagesFts(db);
+  // The legacy human-only `turns` snapshot is superseded by `messages` (which stores user turns
+  // too). Drop it so we don't keep a second copy of every human turn; `backfill --force`
+  // repopulates `messages` from the transcripts.
+  db.exec(`DROP TABLE IF EXISTS turns_fts; DROP TABLE IF EXISTS turns;`);
 }
 
-/** Populate turns_fts from turns when the FTS table is new but turns already has rows. */
-function backfillTurnsFts(db: Store): void {
-  const fts = (db.prepare(`SELECT count(*) c FROM turns_fts`).get() as { c: number }).c;
+/** Populate messages_fts from messages when the FTS table is new but messages already has rows. */
+function backfillMessagesFts(db: Store): void {
+  const fts = (db.prepare(`SELECT count(*) c FROM messages_fts`).get() as { c: number }).c;
   if (fts > 0) return;
-  const turns = (db.prepare(`SELECT count(*) c FROM turns`).get() as { c: number }).c;
-  if (turns === 0) return;
+  const msgs = (db.prepare(`SELECT count(*) c FROM messages`).get() as { c: number }).c;
+  if (msgs === 0) return;
   db.exec(
-    `INSERT INTO turns_fts (rowid, text, session, ts, branch)
-     SELECT id, text, session, ts, branch FROM turns`,
+    `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
+     SELECT id, text, session, ts, branch, role, agent FROM messages`,
   );
 }
 
@@ -206,9 +225,9 @@ export function setMeta(db: Store, key: string, value: string): void {
 
 export function insertToolEvent(db: Store, e: ToolEventInput): void {
   db.prepare(
-    `INSERT INTO events (ts, type, session, repo, branch, cwd, tool, file, command)
-     VALUES (@ts, 'tool', @session, @repo, @branch, @cwd, @tool, @file, @command)`,
-  ).run(e);
+    `INSERT INTO events (ts, type, session, repo, branch, cwd, tool, file, command, agent)
+     VALUES (@ts, 'tool', @session, @repo, @branch, @cwd, @tool, @file, @command, @agent)`,
+  ).run({ ...e, agent: e.agent ?? null });
 }
 
 /** Insert a note (decision or learning) and return its id, so its embedding can link back to it. */
@@ -307,21 +326,25 @@ export function deleteNote(db: Store, id: number): boolean {
   return true;
 }
 
-/** Snapshot a human turn so read_turns survives transcript pruning, and index it for grep_turns. */
-export function insertTurn(db: Store, t: TurnInput): void {
+/** Snapshot a full conversation message (any role, including subagents) and index it for grep. */
+export function insertMessage(db: Store, m: MessageInput): void {
   const info = db
-    .prepare(`INSERT INTO turns (session, ts, branch, text) VALUES (@session, @ts, @branch, @text)`)
-    .run(t);
+    .prepare(
+      `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text)
+       VALUES (@session, @ts, @branch, @role, @agent, @agentId, @text)`,
+    )
+    .run(m);
   db.prepare(
-    `INSERT INTO turns_fts (rowid, text, session, ts, branch) VALUES (@rowid, @text, @session, @ts, @branch)`,
-  ).run({ rowid: Number(info.lastInsertRowid), text: t.text, session: t.session, ts: t.ts, branch: t.branch });
+    `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
+     VALUES (@rowid, @text, @session, @ts, @branch, @role, @agent)`,
+  ).run({ rowid: Number(info.lastInsertRowid), text: m.text, session: m.session, ts: m.ts, branch: m.branch, role: m.role, agent: m.agent });
 }
 
-export function getTurns(db: Store, session: string, branch?: string): StoredTurn[] {
+export function getMessages(db: Store, session: string, branch?: string): StoredMessage[] {
   const clause = branch === undefined ? "" : " AND branch = @branch";
   return db
-    .prepare(`SELECT ts, branch, text FROM turns WHERE session = @session${clause} ORDER BY ts, id`)
-    .all({ session, branch }) as StoredTurn[];
+    .prepare(`SELECT ts, branch, role, agent, text FROM messages WHERE session = @session${clause} ORDER BY ts, id`)
+    .all({ session, branch }) as StoredMessage[];
 }
 
 interface EventRow {
@@ -416,6 +439,8 @@ export interface TurnHit {
   session: string;
   branch: string | null;
   ts: string;
+  role: string;
+  agent: string | null;
   snippet: string;
 }
 
@@ -432,14 +457,18 @@ function ftsQuery(raw: string): string | null {
   return terms.map((t) => `"${t}"`).join(" OR ");
 }
 
-/** Keyword/full-text search over verbatim turns — the fallback when `search` misses. */
+/**
+ * Keyword/full-text search over the full conversation — every role and every subagent — the
+ * fallback when semantic `search` misses something said (or done) in passing. Matches the raw
+ * user prompts, the assistant's prose, and the verbatim scripts/code it wrote.
+ */
 export function grepTurns(db: Store, query: string, limit = 8): TurnHit[] {
   const match = ftsQuery(query);
   if (!match) return [];
   return db
     .prepare(
-      `SELECT session, branch, ts, snippet(turns_fts, 0, '«', '»', '…', 16) AS snippet
-       FROM turns_fts WHERE turns_fts MATCH @match
+      `SELECT session, branch, ts, role, agent, snippet(messages_fts, 0, '«', '»', '…', 16) AS snippet
+       FROM messages_fts WHERE messages_fts MATCH @match
        ORDER BY rank LIMIT @limit`,
     )
     .all({ match, limit }) as TurnHit[];
@@ -530,6 +559,31 @@ export function setIngested(db: Store, filePath: string, mtimeMs: number): void 
 export function deleteSession(db: Store, session: string): void {
   db.prepare(`DELETE FROM events WHERE session = ? AND type = 'tool'`).run(session);
   db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
-  db.prepare(`DELETE FROM turns WHERE session = ?`).run(session);
-  db.prepare(`DELETE FROM turns_fts WHERE session = ?`).run(session);
+  db.prepare(`DELETE FROM messages WHERE session = ?`).run(session);
+  db.prepare(`DELETE FROM messages_fts WHERE session = ?`).run(session);
+}
+
+/**
+ * Retention safety valve. Drops raw history (messages, turns, tool events, framings) older than
+ * `days`; recorded decisions and learnings are kept — they're the distilled long-term memory.
+ * `days <= 0` is a no-op (the default: keep everything). Returns the message rows removed.
+ */
+export function pruneOlderThan(db: Store, days: number): number {
+  if (!Number.isFinite(days) || days <= 0) return 0;
+  const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+  const run = db.transaction(() => {
+    db.prepare(`DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE ts < @cutoff)`).run({ cutoff });
+    const m = db.prepare(`DELETE FROM messages WHERE ts < @cutoff`).run({ cutoff });
+    db.prepare(`DELETE FROM events WHERE type = 'tool' AND ts < @cutoff`).run({ cutoff });
+    db.prepare(`DELETE FROM embeddings WHERE kind = 'framing' AND ts < @cutoff`).run({ cutoff });
+    return m.changes;
+  });
+  return run();
+}
+
+/** The configured retention window in days, or 0 (unlimited) when unset/invalid. */
+export function getRetentionDays(db: Store): number {
+  const raw = getMeta(db, "retention_days");
+  const n = raw === undefined ? 0 : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }

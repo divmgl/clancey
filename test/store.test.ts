@@ -15,8 +15,9 @@ import {
   grepTurns,
   getNudgeState,
   setNudgeState,
-  insertTurn,
-  getTurns,
+  insertMessage,
+  getMessages,
+  pruneOlderThan,
   deleteSession,
   getNote,
   updateNote,
@@ -130,54 +131,83 @@ describe("search", () => {
   });
 });
 
-describe("turns", () => {
-  test("stores and returns turns in chronological order", () => {
-    insertTurn(db, { session: "s1", ts: "2026-01-01T00:00:02Z", branch: "feature/x", text: "second" });
-    insertTurn(db, { session: "s1", ts: "2026-01-01T00:00:01Z", branch: "feature/x", text: "first" });
+function msg(over: Partial<Parameters<typeof insertMessage>[1]> = {}) {
+  insertMessage(db, {
+    session: "s1",
+    ts: "2026-01-01T00:00:00Z",
+    branch: "feature/x",
+    role: "user",
+    agent: null,
+    agentId: null,
+    text: "hello there",
+    ...over,
+  });
+}
+
+describe("messages", () => {
+  test("stores and returns the full conversation in chronological order", () => {
+    msg({ ts: "2026-01-01T00:00:02Z", role: "assistant", text: "second" });
+    msg({ ts: "2026-01-01T00:00:01Z", text: "first" });
     assert.deepEqual(
-      getTurns(db, "s1").map((t) => t.text),
+      getMessages(db, "s1").map((m) => m.text),
       ["first", "second"],
     );
   });
 
-  test("filters by branch", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: "feature/x", text: "x turn" });
-    insertTurn(db, { session: "s1", ts: "t2", branch: "feature/y", text: "y turn" });
+  test("preserves role and subagent attribution", () => {
+    msg({ ts: "t1", role: "user", text: "ask" });
+    msg({ ts: "t2", role: "assistant", agent: "Explore", text: "explored" });
+    const got = getMessages(db, "s1");
     assert.deepEqual(
-      getTurns(db, "s1", "feature/y").map((t) => t.text),
+      got.map((m) => [m.role, m.agent]),
+      [
+        ["user", null],
+        ["assistant", "Explore"],
+      ],
+    );
+  });
+
+  test("filters by branch", () => {
+    msg({ ts: "t1", branch: "feature/x", text: "x turn" });
+    msg({ ts: "t2", branch: "feature/y", text: "y turn" });
+    assert.deepEqual(
+      getMessages(db, "s1", "feature/y").map((m) => m.text),
       ["y turn"],
     );
   });
 
-  test("deleteSession clears the session's turns", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "gone" });
-    insertTurn(db, { session: "s2", ts: "t1", branch: null, text: "kept" });
+  test("deleteSession clears the session's messages", () => {
+    msg({ ts: "t1", text: "gone" });
+    msg({ session: "s2", ts: "t1", text: "kept" });
     deleteSession(db, "s1");
-    assert.equal(getTurns(db, "s1").length, 0);
-    assert.equal(getTurns(db, "s2").length, 1);
+    assert.equal(getMessages(db, "s1").length, 0);
+    assert.equal(getMessages(db, "s2").length, 1);
   });
 });
 
 describe("grepTurns", () => {
-  test("finds a turn by keyword that semantic search would miss", () => {
-    insertTurn(db, {
-      session: "s1",
-      ts: "t1",
-      branch: "feature/x",
-      text: "the effort label should be ez, normal, or heroic",
-    });
-    insertTurn(db, { session: "s2", ts: "t2", branch: "feature/y", text: "unrelated chatter about icons" });
-    const hits = grepTurns(db, "effort label");
+  test("finds an assistant-authored script body the user never typed", () => {
+    msg({ session: "s1", ts: "t1", role: "assistant", text: "「Bash」\nnode run-cohort.ts --count 6" });
+    msg({ session: "s2", ts: "t2", role: "assistant", text: "unrelated chatter about icons" });
+    const hits = grepTurns(db, "cohort");
     assert.equal(hits.length, 1);
     assert.equal(hits[0].session, "s1");
-    assert.equal(hits[0].branch, "feature/x");
-    assert.match(hits[0].snippet, /effort/);
+    assert.equal(hits[0].role, "assistant");
+    assert.match(hits[0].snippet, /cohort/);
+  });
+
+  test("surfaces subagent turns with their agent attribution", () => {
+    msg({ session: "s1", ts: "t1", role: "assistant", agent: "Explore", text: "found the entrypoint in run-headless-agent" });
+    const hits = grepTurns(db, "entrypoint");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].role, "assistant");
+    assert.equal(hits[0].agent, "Explore");
   });
 
   test("matches any term and ranks turns hitting more of them first (OR semantics)", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "effort and difficulty together" });
-    insertTurn(db, { session: "s2", ts: "t2", branch: null, text: "effort alone" });
-    insertTurn(db, { session: "s3", ts: "t3", branch: null, text: "nothing relevant here" });
+    msg({ session: "s1", ts: "t1", branch: null, text: "effort and difficulty together" });
+    msg({ session: "s2", ts: "t2", branch: null, text: "effort alone" });
+    msg({ session: "s3", ts: "t3", branch: null, text: "nothing relevant here" });
     // Both s1 and s2 surface (a missing word doesn't wipe results); s1 ranks first.
     assert.deepEqual(
       grepTurns(db, "effort difficulty").map((h) => h.session),
@@ -186,7 +216,7 @@ describe("grepTurns", () => {
   });
 
   test("sanitizes punctuation and FTS operators instead of throwing", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "the build broke on CI again" });
+    msg({ session: "s1", ts: "t1", branch: null, text: "the build broke on CI again" });
     assert.doesNotThrow(() => grepTurns(db, 'build AND "CI" OR (broke)*'));
     assert.deepEqual(
       grepTurns(db, "build CI broke").map((h) => h.session),
@@ -195,20 +225,46 @@ describe("grepTurns", () => {
   });
 
   test("returns nothing for a query with no searchable tokens", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "anything" });
+    msg({ session: "s1", ts: "t1", branch: null, text: "anything" });
     assert.deepEqual(grepTurns(db, "  -- !! "), []);
   });
 
-  test("deleteSession removes turns from the full-text index", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "ephemeral note" });
+  test("deleteSession removes messages from the full-text index", () => {
+    msg({ session: "s1", ts: "t1", branch: null, text: "ephemeral note" });
     deleteSession(db, "s1");
     assert.deepEqual(grepTurns(db, "ephemeral"), []);
   });
 
   test("respects the limit", () => {
-    insertTurn(db, { session: "s1", ts: "t1", branch: null, text: "shared keyword one" });
-    insertTurn(db, { session: "s2", ts: "t2", branch: null, text: "shared keyword two" });
+    msg({ session: "s1", ts: "t1", branch: null, text: "shared keyword one" });
+    msg({ session: "s2", ts: "t2", branch: null, text: "shared keyword two" });
     assert.equal(grepTurns(db, "shared keyword", 1).length, 1);
+  });
+});
+
+describe("pruneOlderThan", () => {
+  test("drops history older than the window but keeps recent rows and recorded notes", () => {
+    const old = "2020-01-01T00:00:00Z";
+    const recent = new Date().toISOString();
+    msg({ session: "s1", ts: old, text: "ancient turn" });
+    msg({ session: "s1", ts: recent, text: "fresh turn" });
+    insertNote(db, { kind: "decision", session: "s1", repo: "/r", branch: "b", body: "kept decision", detail: null, files: null, ts: old });
+
+    const removed = pruneOlderThan(db, 30);
+    assert.equal(removed, 1);
+    assert.deepEqual(
+      getMessages(db, "s1").map((m) => m.text),
+      ["fresh turn"],
+    );
+    assert.deepEqual(grepTurns(db, "ancient"), []);
+    // Recorded decisions are the distilled long-term memory — never pruned.
+    assert.equal(recall(db, { branch: "b" })[0].decisions.length, 1);
+  });
+
+  test("is a no-op for a non-positive window", () => {
+    msg({ session: "s1", ts: "2020-01-01T00:00:00Z", text: "ancient" });
+    assert.equal(pruneOlderThan(db, 0), 0);
+    assert.equal(getMessages(db, "s1").length, 1);
   });
 });
 
@@ -262,11 +318,15 @@ describe("schema migration", () => {
     }
   });
 
-  test("indexes pre-existing turns into turns_fts when the FTS table is first created", () => {
+  test("indexes pre-existing messages into messages_fts when the FTS table is first created", () => {
     const p = path.join(os.tmpdir(), `clancey-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     const old = new Database(p);
-    old.exec(`CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL, branch TEXT, text TEXT NOT NULL)`);
-    old.prepare(`INSERT INTO turns (session, ts, branch, text) VALUES ('s1', 't1', 'b', 'historical effort note')`).run();
+    old.exec(
+      `CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL, branch TEXT, role TEXT NOT NULL, agent TEXT, agent_id TEXT, text TEXT NOT NULL)`,
+    );
+    old
+      .prepare(`INSERT INTO messages (session, ts, branch, role, agent, agent_id, text) VALUES ('s1', 't1', 'b', 'assistant', NULL, NULL, 'historical effort note')`)
+      .run();
     old.close();
 
     const migrated = openStore(p);
@@ -275,6 +335,26 @@ describe("schema migration", () => {
         grepTurns(migrated, "historical effort").map((h) => h.session),
         ["s1"],
       );
+    } finally {
+      migrated.close();
+      for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
+    }
+  });
+
+  test("adds messages/events.agent and drops the legacy turns table on an old db", () => {
+    const p = path.join(os.tmpdir(), `clancey-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = new Database(p);
+    old.exec(`CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, type TEXT, session TEXT, repo TEXT, branch TEXT, cwd TEXT, tool TEXT, file TEXT, command TEXT, decision TEXT, why TEXT, files_json TEXT)`);
+    old.exec(`CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL, branch TEXT, text TEXT NOT NULL)`);
+    old.close();
+
+    const migrated = openStore(p);
+    try {
+      const tables = (migrated.prepare(`SELECT name FROM sqlite_master WHERE type IN ('table','virtual')`).all() as { name: string }[]).map((t) => t.name);
+      assert.ok(tables.includes("messages"));
+      assert.ok(!tables.includes("turns"), "legacy turns table is dropped");
+      const eventCols = (migrated.prepare(`PRAGMA table_info(events)`).all() as { name: string }[]).map((c) => c.name);
+      assert.ok(eventCols.includes("agent"));
     } finally {
       migrated.close();
       for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
