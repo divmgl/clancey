@@ -65,7 +65,13 @@ export function getCodexSessionsDir(): string {
   return path.join(os.homedir(), ".codex", "sessions");
 }
 
-export type TranscriptKind = "claude" | "codex";
+/** OpenCode's session store, XDG-aware: $XDG_DATA_HOME/opencode/storage (falls back to ~/.local/share). */
+export function getOpencodeStorageDir(): string {
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(dataHome, "opencode", "storage");
+}
+
+export type TranscriptKind = "claude" | "codex" | "opencode";
 
 export interface TranscriptRef {
   path: string;
@@ -262,19 +268,58 @@ export async function listCodexFiles(): Promise<string[]> {
   return files;
 }
 
-/** All ingestable transcripts across Claude Code and Codex, tagged by kind. */
+/**
+ * OpenCode keeps one `<sessionId>.json` per session under `storage/session/<projectId>/`. The
+ * conversation itself lives elsewhere (storage/message/<sessionId>/ and storage/part/<msgId>/),
+ * so the ref's path is the session-metadata file and the parser locates the rest from it.
+ */
+export async function listOpencodeFiles(): Promise<string[]> {
+  const sessionRoot = path.join(getOpencodeStorageDir(), "session");
+  const files: string[] = [];
+  let projects: fs.Dirent[];
+  try {
+    projects = await fs.promises.readdir(sessionRoot, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+  for (const project of projects) {
+    if (!project.isDirectory()) continue;
+    let entries: string[];
+    try {
+      entries = await fs.promises.readdir(path.join(sessionRoot, project.name));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.endsWith(".json")) files.push(path.join(sessionRoot, project.name, entry));
+    }
+  }
+  return files;
+}
+
+/** Session id for a transcript ref — OpenCode files end in `.json`, the others in `.jsonl`. */
+export function sessionIdOf(ref: TranscriptRef): string {
+  return path.basename(ref.path, ref.kind === "opencode" ? ".json" : ".jsonl");
+}
+
+/** All ingestable transcripts across Claude Code, Codex, and OpenCode, tagged by kind. */
 export async function listAllTranscripts(): Promise<TranscriptRef[]> {
-  const [claude, codex] = await Promise.all([listConversationFiles(), listCodexFiles()]);
+  const [claude, codex, opencode] = await Promise.all([
+    listConversationFiles(),
+    listCodexFiles(),
+    listOpencodeFiles(),
+  ]);
   return [
     ...claude.map((p): TranscriptRef => ({ path: p, kind: "claude" })),
     ...codex.map((p): TranscriptRef => ({ path: p, kind: "codex" })),
+    ...opencode.map((p): TranscriptRef => ({ path: p, kind: "opencode" })),
   ];
 }
 
-/** Resolve a session id to its transcript (searches Claude then Codex), or null. */
+/** Resolve a session id to its transcript (searches Claude, Codex, then OpenCode), or null. */
 export async function resolveSession(sessionId: string): Promise<TranscriptRef | null> {
   const all = await listAllTranscripts();
-  return all.find((r) => path.basename(r.path, ".jsonl") === sessionId) ?? null;
+  return all.find((r) => sessionIdOf(r) === sessionId) ?? null;
 }
 
 /** Parse one transcript into tool events, conversation messages, human turns, title, and framing. */
@@ -458,7 +503,148 @@ export async function parseCodexTranscript(filePath: string): Promise<ParsedTran
   return { sessionId, title: null, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };
 }
 
+/** OpenCode tools that touch a file (its input carries `filePath`). */
+const OPENCODE_FILE_TOOLS = new Set(["edit", "write"]);
+
+/** Render an OpenCode tool's verbatim input (the scripts/code we keep), or null to skip it. */
+function renderOpencodeTool(tool: string, input: Record<string, unknown>): string | null {
+  const file = typeof input.filePath === "string" ? input.filePath : "";
+  const keep = (label: string, body: string): string | null =>
+    !body || looksBinary(body) ? null : `「${label}」\n${body}`;
+
+  if (tool === "bash" && typeof input.command === "string") return keep("Bash", input.command);
+  if (tool === "write" && typeof input.content === "string") return keep(`Write ${file}`.trim(), input.content);
+  if (tool === "edit" && typeof input.newString === "string") return keep(`Edit ${file}`.trim(), input.newString);
+  return null;
+}
+
+interface OpencodePart {
+  type?: string;
+  text?: unknown;
+  synthetic?: unknown;
+  tool?: unknown;
+  state?: { input?: unknown };
+}
+
+/** Read + JSON-parse every `*.json` in a directory, sorted by filename; missing dir → []. */
+async function readJsonDir<T>(dir: string): Promise<T[]> {
+  let names: string[];
+  try {
+    names = (await fs.promises.readdir(dir)).filter((n) => n.endsWith(".json")).sort();
+  } catch {
+    return [];
+  }
+  const out: T[] = [];
+  for (const name of names) {
+    try {
+      out.push(JSON.parse(await fs.promises.readFile(path.join(dir, name), "utf-8")) as T);
+    } catch {
+      // skip unreadable/corrupt files
+    }
+  }
+  return out;
+}
+
+/** Locate the storage root from a session file at `<root>/session/<projectId>/<sessionId>.json`. */
+function opencodeStorageRoot(sessionFile: string): string {
+  return path.dirname(path.dirname(path.dirname(sessionFile)));
+}
+
+/**
+ * Every file that makes up one OpenCode session — the session-metadata file plus its message
+ * files. Backfill takes the newest mtime across these so a new turn (a new message file, and the
+ * message's rewrite when it completes) re-ingests the session. Part files are not walked: a new
+ * turn always writes a new message file, which is enough of a change signal.
+ */
+export async function listOpencodeUnitFiles(sessionFile: string): Promise<string[]> {
+  const sessionId = path.basename(sessionFile, ".json");
+  const messageDir = path.join(opencodeStorageRoot(sessionFile), "message", sessionId);
+  let messages: string[] = [];
+  try {
+    messages = (await fs.promises.readdir(messageDir))
+      .filter((n) => n.endsWith(".json"))
+      .map((n) => path.join(messageDir, n));
+  } catch {
+    // no messages yet
+  }
+  return [sessionFile, ...messages];
+}
+
+/**
+ * Parse an OpenCode session. Unlike Claude/Codex's single JSONL file, an OpenCode conversation is
+ * spread across `session/<id>.json` (title + cwd), `message/<id>/*.json` (one file per turn), and
+ * `part/<msgId>/*.json` (the turn's content). Repo/cwd come from the session's `directory`; there
+ * is no branch in OpenCode storage, so events are branch-less. Backfill-only — OpenCode has no hook.
+ */
+export async function parseOpencodeTranscript(sessionFile: string): Promise<ParsedTranscript> {
+  const root = opencodeStorageRoot(sessionFile);
+  let meta: { id?: unknown; title?: unknown; directory?: unknown } = {};
+  try {
+    meta = JSON.parse(await fs.promises.readFile(sessionFile, "utf-8"));
+  } catch {
+    // missing/corrupt session file — fall through to an empty parse
+  }
+  const sessionId = typeof meta.id === "string" ? meta.id : path.basename(sessionFile, ".json");
+  const title = typeof meta.title === "string" ? meta.title : null;
+  const cwd = typeof meta.directory === "string" ? meta.directory : null;
+
+  const toolEvents: ToolEvent[] = [];
+  const userTurns: UserTurn[] = [];
+  const messages: ConvMessage[] = [];
+
+  const msgMetas = await readJsonDir<{ id?: unknown; role?: unknown; time?: { created?: unknown } }>(
+    path.join(root, "message", sessionId),
+  );
+  const createdMs = (m: { time?: { created?: unknown } }) =>
+    typeof m.time?.created === "number" ? m.time.created : 0;
+  const idOf = (m: { id?: unknown }) => (typeof m.id === "string" ? m.id : "");
+  msgMetas.sort((a, b) => createdMs(a) - createdMs(b) || (idOf(a) < idOf(b) ? -1 : idOf(a) > idOf(b) ? 1 : 0));
+
+  for (const m of msgMetas) {
+    const role: Role | null = m.role === "assistant" ? "assistant" : m.role === "user" ? "user" : null;
+    const id = idOf(m);
+    if (!role || !id) continue;
+    const timestamp = createdMs(m) ? new Date(createdMs(m)).toISOString() : "";
+
+    const parts = await readJsonDir<OpencodePart>(path.join(root, "part", id));
+    const rendered: string[] = []; // prose + verbatim tool bodies → the stored message
+    const prose: string[] = []; // text-only → the human turn / framing
+
+    for (const part of parts) {
+      if (part.type === "text") {
+        // Synthetic text is OpenCode-injected file dumps, not authored prose — drop it.
+        if (part.synthetic || typeof part.text !== "string" || !part.text.trim()) continue;
+        rendered.push(part.text);
+        if (role === "user") prose.push(part.text);
+      } else if (part.type === "tool") {
+        const tool = typeof part.tool === "string" ? part.tool : "";
+        const input = (part.state?.input ?? {}) as Record<string, unknown>;
+        if (OPENCODE_FILE_TOOLS.has(tool) && typeof input.filePath === "string") {
+          toolEvents.push({ tool, file: input.filePath, command: null, branch: null, cwd, timestamp });
+        } else if (tool === "bash" && typeof input.command === "string") {
+          toolEvents.push({ tool, file: null, command: input.command, branch: null, cwd, timestamp });
+        }
+        const body = renderOpencodeTool(tool, input);
+        if (body) rendered.push(body);
+      }
+      // reasoning (thinking), patch (files already covered by edit/write), step-*, file: dropped.
+    }
+
+    if (role === "user") {
+      const turn = prose.join("\n").trim();
+      if (!turn || isNoiseUserText(turn)) continue; // also drops the message for noise turns
+      userTurns.push({ text: turn, branch: null, timestamp });
+    }
+    const text = rendered.join("\n").trim();
+    if (text) messages.push({ role, agent: null, agentId: null, branch: null, timestamp, text });
+  }
+
+  return { sessionId, title, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };
+}
+
 /** Parse any transcript by kind. */
 export function parseAny(ref: TranscriptRef): Promise<ParsedTranscript> {
-  return ref.kind === "codex" ? parseCodexTranscript(ref.path) : parseTranscript(ref.path);
+  if (ref.kind === "codex") return parseCodexTranscript(ref.path);
+  if (ref.kind === "opencode") return parseOpencodeTranscript(ref.path);
+  return parseTranscript(ref.path);
 }

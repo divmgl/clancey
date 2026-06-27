@@ -1,0 +1,8 @@
+{
+  "id": "prt_005",
+  "sessionID": "ses_test",
+  "messageID": "msg_002",
+  "type": "text",
+  "text": "<file>\n00001| injected file dump that must be dropped\n</file>",
+  "synthetic": true
+}

@@ -18,7 +18,7 @@ Later you just ask Claude things like *"which conversation produced this PR, and
 npx -y clancey setup
 ```
 
-Setup asks which tools to enable Clancey for (Claude Code and Codex), then imports your existing history from both so you can ask about it right away. Restart your tools when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
+Setup asks which tools to enable Clancey for (Claude Code, Codex, and OpenCode), then imports your existing history from each so you can ask about it right away. Restart your tools when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
 
 ## Using it
 
@@ -32,7 +32,7 @@ As you work, Claude records the decisions it makes and the incidental things it 
 
 Recall is semantic, so it finds things by meaning even when you don't remember the exact words. When something was only ever said in passing — never recorded as a decision — Claude falls back to a plain keyword search over the verbatim conversation, so an offhand remark is still findable by the words you used.
 
-Codex works too, with one difference: Clancey imports your Codex history and answers from inside Codex, but it only records live as you work in Claude Code.
+Codex and OpenCode work too, with one difference: Clancey imports their history and answers from inside them, but it only records live as you work in Claude Code.
 
 ## Keep your history
 

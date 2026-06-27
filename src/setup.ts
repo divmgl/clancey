@@ -20,12 +20,24 @@ import {
   storeTotals,
   CLANCEY_DIR,
 } from "./store.js";
-import { listAllTranscripts, listSubagents, parseAny, parseSubagent, ParsedTranscript, SubagentRef } from "./parser.js";
+import {
+  listAllTranscripts,
+  listSubagents,
+  listOpencodeUnitFiles,
+  parseAny,
+  parseSubagent,
+  getOpencodeStorageDir,
+  ParsedTranscript,
+  SubagentRef,
+} from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { repoKey } from "./git.js";
 import { setConsoleSilent } from "./logger.js";
 
 const tildify = (p: string) => p.replace(os.homedir(), "~");
+
+/** A tool clancey can wire itself into. */
+export type Target = "claude" | "codex" | "opencode";
 
 const POST_TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash";
 const FRAMING_MAX_CHARS = 2000;
@@ -65,9 +77,11 @@ export async function backfill(
     // A session and its subagents are one ingest unit: subagent turns fold under the parent
     // session id, and deleteSession() wipes the whole unit before re-inserting. Gate on the
     // newest mtime across the parent transcript and all its subagent files so a change to any
-    // of them re-ingests the unit and avoids partial folds.
+    // of them re-ingests the unit and avoids partial folds. OpenCode spreads one session across
+    // many files, so its unit is the session-metadata file plus its message files.
     const subRefs = ref.kind === "claude" ? await listSubagents(file) : [];
-    const unitFiles = [file, ...subRefs.map((s) => s.path)];
+    const unitFiles =
+      ref.kind === "opencode" ? await listOpencodeUnitFiles(file) : [file, ...subRefs.map((s) => s.path)];
     const mtimes = await Promise.all(unitFiles.map((f) => fs.promises.stat(f).then((s) => s.mtimeMs)));
     const unitMtime = Math.max(...mtimes);
     if (!opts.force && getIngestedMtime(db, file) === unitMtime) continue;
@@ -214,6 +228,22 @@ interface HookGroup {
 
 const CODEX_CONFIG = path.join(os.homedir(), ".codex", "config.toml");
 
+/** OpenCode's config dir, XDG-aware: $XDG_CONFIG_HOME/opencode (falls back to ~/.config). */
+function opencodeConfigDir(): string {
+  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(configHome, "opencode");
+}
+
+/** The OpenCode config file to write — an existing opencode.jsonc/json, else a new opencode.json. */
+function opencodeConfigPath(): string {
+  const dir = opencodeConfigDir();
+  for (const name of ["opencode.jsonc", "opencode.json"]) {
+    const candidate = path.join(dir, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dir, "opencode.json");
+}
+
 async function hasClaude(): Promise<boolean> {
   try {
     await execFileAsync("claude", ["--version"]);
@@ -225,6 +255,70 @@ async function hasClaude(): Promise<boolean> {
 
 function hasCodex(): boolean {
   return fs.existsSync(path.join(os.homedir(), ".codex"));
+}
+
+function hasOpencode(): boolean {
+  return fs.existsSync(getOpencodeStorageDir()) || fs.existsSync(opencodeConfigDir());
+}
+
+/**
+ * Strip line and block comments from JSONC without touching comment-like text inside strings
+ * (the `$schema` value is a `https://` URL). Walks char-by-char tracking string/escape state.
+ */
+function stripJsonComments(input: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const next = input[i + 1];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (ch === "/" && next === "/") {
+      while (i < input.length && input[i] !== "\n") i++;
+      if (i < input.length) out += "\n";
+    } else if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i++;
+      i++; // land on the trailing '/'
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/** Parse JSONC tolerantly: plain JSON first (the common case), comment-stripped only on failure. */
+function parseJsonc(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return JSON.parse(stripJsonComments(raw)) as Record<string, unknown>;
+  }
+}
+
+/** Add (or re-pin) the clancey MCP server in OpenCode's config, idempotently. */
+export function configureOpencode(spec: string): { result: "added" | "updated"; file: string } {
+  const file = opencodeConfigPath();
+  const config = fs.existsSync(file) ? parseJsonc(fs.readFileSync(file, "utf-8")) : {};
+  config["$schema"] ??= "https://opencode.ai/config.json";
+  const mcp = (config.mcp && typeof config.mcp === "object" ? config.mcp : {}) as Record<string, unknown>;
+  const had = "clancey" in mcp;
+  mcp.clancey = { type: "local", command: ["npx", "-y", spec], enabled: true };
+  config.mcp = mcp;
+
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
+  return { result: had ? "updated" : "added", file };
 }
 
 /** Add (or re-pin) the clancey MCP server in Codex's config.toml, idempotently. */
@@ -327,19 +421,20 @@ async function cleanLegacyIndex(clean: boolean): Promise<void> {
 }
 
 /** Pick which tools to register the MCP server with — detected ones pre-selected. */
-async function selectTargets(preset: ("claude" | "codex")[] | null): Promise<("claude" | "codex")[]> {
-  const detected = { claude: await hasClaude(), codex: hasCodex() };
-  const installed = (["claude", "codex"] as const).filter((t) => detected[t]);
+async function selectTargets(preset: Target[] | null): Promise<Target[]> {
+  const detected = { claude: await hasClaude(), codex: hasCodex(), opencode: hasOpencode() };
+  const installed = (["claude", "codex", "opencode"] as const).filter((t) => detected[t]);
 
   if (preset) return preset;
   if (!process.stdin.isTTY) return [...installed];
 
-  const selected = await multiselect<"all" | "claude" | "codex">({
+  const selected = await multiselect<"all" | Target>({
     message: "Set up the MCP server for which tools?",
     options: [
       { value: "all", label: "All", hint: "every detected tool" },
       { value: "claude", label: "Claude Code", hint: detected.claude ? "hooks + MCP" : "not detected" },
       { value: "codex", label: "Codex", hint: detected.codex ? "MCP, backfill-only" : "not detected" },
+      { value: "opencode", label: "OpenCode", hint: detected.opencode ? "MCP, backfill-only" : "not detected" },
     ],
     initialValues: [...installed],
     required: false,
@@ -349,11 +444,11 @@ async function selectTargets(preset: ("claude" | "codex")[] | null): Promise<("c
     process.exit(0);
   }
   if (selected.includes("all")) return [...installed];
-  return selected.filter((t): t is "claude" | "codex" => t !== "all");
+  return selected.filter((t): t is Target => t !== "all");
 }
 
 /** `clancey setup` — register the MCP server with the chosen tools, backfill, then clean the v1 index. */
-export async function setup(opts: { cleanLegacy?: boolean; targets?: ("claude" | "codex")[] } = {}): Promise<void> {
+export async function setup(opts: { cleanLegacy?: boolean; targets?: Target[] } = {}): Promise<void> {
   setConsoleSilent(true); // clack owns the terminal; log() keeps writing to the file
   intro("clancey setup");
 
@@ -382,6 +477,15 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: ("claude" |
     );
   }
 
+  if (targets.includes("opencode")) {
+    const { result, file } = configureOpencode(spec);
+    clog.success(
+      result === "added"
+        ? `Registered OpenCode MCP server (${spec}) in ${tildify(file)}`
+        : `Re-pinned OpenCode MCP server to ${spec} in ${tildify(file)}`,
+    );
+  }
+
   const backfillSpin = spinner();
   backfillSpin.start("Backfilling conversations");
   const db = openStore();
@@ -401,6 +505,7 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: ("claude" |
   // Only after the new store is built do we offer to remove the old index.
   await cleanLegacyIndex(opts.cleanLegacy ?? false);
 
-  const restart = targets.map((t) => (t === "claude" ? "Claude Code" : "Codex")).join(" and ");
+  const label: Record<Target, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+  const restart = targets.map((t) => label[t]).join(" and ");
   outro(restart ? `Done — restart ${restart} to load the MCP server.` : "Done.");
 }

@@ -1,0 +1,18 @@
+{
+  "id": "prt_002",
+  "sessionID": "ses_test",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_edit",
+  "tool": "edit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/repo/src/auth.ts",
+      "oldString": "export const token = 1;",
+      "newString": "export const token = refreshToken();"
+    },
+    "output": "",
+    "title": "src/auth.ts"
+  }
+}

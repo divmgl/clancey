@@ -1,0 +1,8 @@
+{
+  "id": "msg_001",
+  "sessionID": "ses_test",
+  "role": "user",
+  "time": { "created": 1763497687000 },
+  "agent": "build",
+  "model": { "providerID": "opencode", "modelID": "gemini-3-pro" }
+}

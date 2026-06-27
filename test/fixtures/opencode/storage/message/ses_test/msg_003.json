@@ -1,0 +1,7 @@
+{
+  "id": "msg_003",
+  "sessionID": "ses_test",
+  "role": "user",
+  "time": { "created": 1763497689000 },
+  "agent": "build"
+}

@@ -5,6 +5,7 @@ import {
   extractTextContent,
   parseTranscript,
   parseCodexTranscript,
+  parseOpencodeTranscript,
   listSubagents,
   parseSubagent,
 } from "../src/parser.ts";
@@ -169,5 +170,61 @@ describe("parseCodexTranscript", () => {
     const t = await parseCodexTranscript(fixture);
     assert.deepEqual(t.userTurns.map((u) => u.text), ["Refactor the state management API to drop all casting."]);
     assert.equal(t.framing, "Refactor the state management API to drop all casting.");
+  });
+});
+
+describe("parseOpencodeTranscript", () => {
+  const fixture = path.join(import.meta.dirname, "fixtures", "opencode", "storage", "session", "proj1", "ses_test.json");
+
+  test("reads title + session id from the session-metadata file", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    assert.equal(t.sessionId, "ses_test");
+    assert.equal(t.title, "My OpenCode feature work");
+  });
+
+  test("extracts edit/write file events and bash commands, with session directory as cwd and no branch", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    const ts = new Date(1763497688000).toISOString();
+    assert.deepEqual(t.toolEvents, [
+      { tool: "edit", file: "/repo/src/auth.ts", command: null, branch: null, cwd: "/repo", timestamp: ts },
+      { tool: "bash", file: null, command: "bun test", branch: null, cwd: "/repo", timestamp: ts },
+    ]);
+  });
+
+  test("does not double-count a file already covered by edit/write via the patch part", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    assert.equal(t.toolEvents.filter((e) => e.file === "/repo/src/auth.ts").length, 1);
+  });
+
+  test("keeps the real human turn; drops short/noise turns; framing is the first turn", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    assert.deepEqual(
+      t.userTurns.map((u) => u.text),
+      ["We need to refactor the auth module because it is tangled and hard to test."],
+    );
+    assert.equal(t.framing, "We need to refactor the auth module because it is tangled and hard to test.");
+  });
+
+  test("renders assistant prose with the verbatim edit/bash bodies; drops reasoning and synthetic file dumps", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    const all = t.messages.map((m) => m.text).join("\n");
+    assert.ok(all.includes("I'll refactor the auth module and add a test."), "assistant prose kept");
+    assert.ok(
+      t.messages.some((m) => m.text.includes("「Edit /repo/src/auth.ts」") && m.text.includes("refreshToken()")),
+      "verbatim edit body kept",
+    );
+    assert.ok(t.messages.some((m) => m.text.includes("「Bash」") && m.text.includes("bun test")), "verbatim bash body kept");
+    assert.ok(!all.includes("internal reasoning"), "reasoning must be dropped");
+    assert.ok(!all.includes("injected file dump"), "synthetic text must be dropped");
+  });
+
+  test("converts epoch-ms timestamps to ISO and carries no agent attribution", async () => {
+    const t = await parseOpencodeTranscript(fixture);
+    assert.ok(t.messages.length > 0);
+    assert.ok(
+      t.messages.every((m) => m.timestamp === new Date(Date.parse(m.timestamp)).toISOString()),
+      "timestamps are ISO strings",
+    );
+    assert.ok(t.messages.every((m) => m.agent === null && m.agentId === null));
   });
 });

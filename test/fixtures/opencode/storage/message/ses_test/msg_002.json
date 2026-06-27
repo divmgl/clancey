@@ -1,0 +1,10 @@
+{
+  "id": "msg_002",
+  "sessionID": "ses_test",
+  "role": "assistant",
+  "time": { "created": 1763497688000, "completed": 1763497688500 },
+  "modelID": "gemini-3-pro",
+  "providerID": "opencode",
+  "mode": "build",
+  "path": { "cwd": "/repo", "root": "/repo" }
+}

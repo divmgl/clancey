@@ -1,0 +1,13 @@
+{
+  "id": "prt_003",
+  "sessionID": "ses_test",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_bash",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "bun test", "description": "Run the test suite" },
+    "output": "ok"
+  }
+}

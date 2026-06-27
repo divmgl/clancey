@@ -1,0 +1,8 @@
+{
+  "id": "prt_006",
+  "sessionID": "ses_test",
+  "messageID": "msg_002",
+  "type": "patch",
+  "hash": "deadbeef",
+  "files": ["/repo/src/auth.ts"]
+}

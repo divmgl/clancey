@@ -28,7 +28,7 @@ import {
 import { resolveSession, parseAny, listSubagents, parseSubagent, ConvMessage } from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { runHook } from "./hook.js";
-import { setup, backfill } from "./setup.js";
+import { setup, backfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 
 function getServerVersion(): string {
@@ -436,9 +436,9 @@ existing conversations.
 
 Options:
   --tools <list>              Comma-separated tools to set up, non-interactively:
-                              claude, codex, or all (e.g. --tools codex). Skips the
-                              picker. Default is the interactive picker; with no TTY,
-                              all detected tools.
+                              claude, codex, opencode, or all (e.g. --tools opencode).
+                              Skips the picker. Default is the interactive picker; with
+                              no TTY, all detected tools.
   --clean-legacy, --yes, -y   Delete the legacy v1 index (~/.clancey/conversations.lance)
                               without prompting. Default is an interactive [Y/n] prompt;
                               with no TTY it is never deleted.
@@ -470,22 +470,22 @@ function parseDays(args: string[]): number | undefined {
   return n;
 }
 
-/** Parse `--tools claude,codex` (or `--tools=all`) into an explicit target list. */
-function parseTools(args: string[]): ("claude" | "codex")[] | undefined {
+/** Parse `--tools claude,codex,opencode` (or `--tools=all`) into an explicit target list. */
+function parseTools(args: string[]): Target[] | undefined {
   const eq = args.find((a) => a.startsWith("--tools="));
   const idx = args.indexOf("--tools");
   const raw = eq ? eq.slice("--tools=".length) : idx !== -1 ? args[idx + 1] : undefined;
   if (raw === undefined) return undefined;
 
-  const out = new Set<"claude" | "codex">();
+  const all: Target[] = ["claude", "codex", "opencode"];
+  const out = new Set<Target>();
   for (const part of raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
     if (part === "all") {
-      out.add("claude");
-      out.add("codex");
-    } else if (part === "claude" || part === "codex") {
-      out.add(part);
+      for (const t of all) out.add(t);
+    } else if ((all as string[]).includes(part)) {
+      out.add(part as Target);
     } else {
-      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, all)`);
+      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, opencode, all)`);
       process.exit(1);
     }
   }

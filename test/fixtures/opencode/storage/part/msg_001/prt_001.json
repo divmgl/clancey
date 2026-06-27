@@ -1,0 +1,9 @@
+{
+  "id": "prt_001",
+  "sessionID": "ses_test",
+  "messageID": "msg_001",
+  "type": "text",
+  "text": "We need to refactor the auth module because it is tangled and hard to test.",
+  "synthetic": false,
+  "time": { "start": 0, "end": 0 }
+}
