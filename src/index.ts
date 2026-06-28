@@ -428,11 +428,12 @@ Options:
                Omit to prune using the previously saved window.
   -h, --help   Show this help.`;
 
-const SETUP_HELP = `clancey setup — wire clancey into Claude Code (global, idempotent)
+const SETUP_HELP = `clancey setup — wire clancey into your AI coding tools (global, idempotent)
 
-Adds PostToolUse + SessionStart hooks to ~/.claude/settings.json, registers the
-MCP server at user scope, offers to remove the legacy v1 index, then backfills
-existing conversations.
+For Claude Code: adds PostToolUse + SessionStart hooks to ~/.claude/settings.json and
+registers the MCP server at user scope. For OpenCode: registers the MCP server and writes a
+live-recording plugin to ~/.config/opencode/plugins/. For Codex: registers the MCP server
+(backfill-only). Then offers to remove the legacy v1 index and backfills existing conversations.
 
 Options:
   --tools <list>              Comma-separated tools to set up, non-interactively:

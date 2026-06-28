@@ -32,7 +32,7 @@ As you work, Claude records the decisions it makes and the incidental things it 
 
 Recall is semantic, so it finds things by meaning even when you don't remember the exact words. When something was only ever said in passing — never recorded as a decision — Claude falls back to a plain keyword search over the verbatim conversation, so an offhand remark is still findable by the words you used.
 
-Codex and OpenCode work too, with one difference: Clancey imports their history and answers from inside them, but it only records live as you work in Claude Code.
+OpenCode has full parity with Claude Code: Clancey imports its history, answers from inside it, and records live as you work (via a plugin setup installs into `~/.config/opencode/plugins/`). Codex is read-only for now — Clancey imports its history and answers from inside it, but only Claude Code and OpenCode record live.
 
 ## Keep your history
 
