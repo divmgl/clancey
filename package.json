@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "A memory for your AI coding sessions: map a branch or file to the Claude Code conversations that produced it, recall recorded decisions, and read the verbatim turns",
   "type": "module",
   "main": "dist/index.js",
