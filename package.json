@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "A memory for your AI coding sessions: map a branch or file to the Claude Code conversations that produced it, recall recorded decisions, and read the verbatim turns",
   "type": "module",
   "main": "dist/index.js",
@@ -37,7 +37,8 @@
     "@clack/prompts": "^1.5.0",
     "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^12.10.0"
+    "better-sqlite3": "^12.10.0",
+    "chrono-node": "^2.9.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

@@ -95,6 +95,15 @@ export interface SearchHit {
   score: number;
 }
 
+export interface TimeFilter {
+  since?: string;
+  until?: string;
+}
+
+export interface SearchOptions extends TimeFilter {
+  limit?: number;
+}
+
 export function openStore(dbPath: string = DB_PATH): Store {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
@@ -124,6 +133,7 @@ function migrate(db: Store): void {
     CREATE INDEX IF NOT EXISTS idx_events_repo_branch ON events(repo, branch);
     CREATE INDEX IF NOT EXISTS idx_events_session ON events(session);
     CREATE INDEX IF NOT EXISTS idx_events_file ON events(file);
+    CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
     CREATE TABLE IF NOT EXISTS embeddings (
       id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +147,7 @@ function migrate(db: Store): void {
       event_id INTEGER                     -- decision rows: the events.id they embed
     );
     CREATE INDEX IF NOT EXISTS idx_embeddings_session ON embeddings(session);
+    CREATE INDEX IF NOT EXISTS idx_embeddings_ts ON embeddings(ts);
 
     -- Full conversation: user + assistant turns (with verbatim scripts/code inline), plus
     -- subagent turns folded under their parent session. This is what makes grep/read cover
@@ -152,6 +163,7 @@ function migrate(db: Store): void {
       text     TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session);
+    CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 
     -- Keyword index over the full conversation. Metadata columns are UNINDEXED so they ride
     -- along with results (role/agent attribution, snippet reconstruction) without being matched.
@@ -366,7 +378,7 @@ function eqOrNull(col: string, value: string | null, param: string): string {
 
 export function recall(
   db: Store,
-  opts: { repo?: string; branch?: string; file?: string; since?: string; limit?: number } = {},
+  opts: { repo?: string; branch?: string; file?: string; since?: string; until?: string; limit?: number } = {},
 ): WorkItem[] {
   const where: string[] = [];
   const params: Record<string, string> = {};
@@ -386,6 +398,10 @@ export function recall(
     where.push("ts >= @since");
     params.since = opts.since;
   }
+  if (opts.until) {
+    where.push("ts < @until");
+    params.until = opts.until;
+  }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
   // Candidate (repo, branch) groups matching the filters, most recent first.
@@ -401,9 +417,11 @@ export function recall(
       .prepare(
         `SELECT * FROM events
          WHERE ${eqOrNull("repo", repo, "repo")} AND ${eqOrNull("branch", branch, "branch")}
+         ${opts.since ? "AND ts >= @since" : ""}
+         ${opts.until ? "AND ts < @until" : ""}
          ORDER BY ts`,
       )
-      .all({ repo, branch }) as EventRow[];
+      .all({ repo, branch, since: opts.since, until: opts.until }) as EventRow[];
 
     const sessions = new Set<string>();
     const files = new Set<string>();
@@ -462,22 +480,55 @@ function ftsQuery(raw: string): string | null {
  * fallback when semantic `search` misses something said (or done) in passing. Matches the raw
  * user prompts, the assistant's prose, and the verbatim scripts/code it wrote.
  */
-export function grepTurns(db: Store, query: string, limit = 8): TurnHit[] {
+function searchOptions(opts: number | SearchOptions): SearchOptions {
+  return typeof opts === "number" ? { limit: opts } : opts;
+}
+
+function timeWhere(opts: TimeFilter, params: Record<string, string | number>): string {
+  const where: string[] = [];
+  if (opts.since) {
+    where.push("ts >= @since");
+    params.since = opts.since;
+  }
+  if (opts.until) {
+    where.push("ts < @until");
+    params.until = opts.until;
+  }
+  return where.length ? ` AND ${where.join(" AND ")}` : "";
+}
+
+export function grepTurns(db: Store, query: string, opts: number | SearchOptions = 8): TurnHit[] {
   const match = ftsQuery(query);
   if (!match) return [];
+  const options = searchOptions(opts);
+  const params: Record<string, string | number> = { match, limit: options.limit ?? 8 };
+  const time = timeWhere(options, params);
   return db
     .prepare(
       `SELECT session, branch, ts, role, agent, snippet(messages_fts, 0, '«', '»', '…', 16) AS snippet
        FROM messages_fts WHERE messages_fts MATCH @match
+       ${time}
        ORDER BY rank LIMIT @limit`,
     )
-    .all({ match, limit }) as TurnHit[];
+    .all(params) as TurnHit[];
 }
 
-export function search(db: Store, queryVector: number[], limit = 8): SearchHit[] {
+export function search(db: Store, queryVector: number[], opts: number | SearchOptions = 8): SearchHit[] {
+  const options = searchOptions(opts);
+  const params: Record<string, string | number> = {};
+  const where: string[] = [];
+  if (options.since) {
+    where.push("ts >= @since");
+    params.since = options.since;
+  }
+  if (options.until) {
+    where.push("ts < @until");
+    params.until = options.until;
+  }
+  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const rows = db
-    .prepare(`SELECT session, repo, branch, kind, text, vector FROM embeddings`)
-    .all() as {
+    .prepare(`SELECT session, repo, branch, kind, text, vector FROM embeddings ${clause}`)
+    .all(params) as {
     session: string;
     repo: string | null;
     branch: string | null;
@@ -496,7 +547,7 @@ export function search(db: Store, queryVector: number[], limit = 8): SearchHit[]
       score: cosineSimilarity(queryVector, blobToVector(r.vector)),
     }))
     .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .slice(0, options.limit ?? 8);
 }
 
 export interface NudgeState {

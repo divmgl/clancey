@@ -110,6 +110,24 @@ describe("recall", () => {
     tool({ branch: "feature/y" });
     assert.equal(recall(db).length, 2);
   });
+
+  test("filters returned work to an exclusive time window", () => {
+    tool({ session: "old", file: "/repo/src/old.ts", ts: "2026-01-01T00:00:00.000Z" });
+    tool({ session: "inside", file: "/repo/src/inside.ts", ts: "2026-01-02T00:00:00.000Z" });
+    tool({ session: "after", file: "/repo/src/after.ts", ts: "2026-01-03T00:00:00.000Z" });
+
+    const items = recall(db, {
+      branch: "feature/x",
+      since: "2026-01-02T00:00:00.000Z",
+      until: "2026-01-03T00:00:00.000Z",
+    });
+
+    assert.equal(items.length, 1);
+    assert.deepEqual(items[0].sessions, ["inside"]);
+    assert.deepEqual(items[0].files, ["/repo/src/inside.ts"]);
+    assert.equal(items[0].firstTs, "2026-01-02T00:00:00.000Z");
+    assert.equal(items[0].lastTs, "2026-01-02T00:00:00.000Z");
+  });
 });
 
 describe("search", () => {
@@ -128,6 +146,44 @@ describe("search", () => {
     insertEmbedding(db, { session: "s1", repo: null, branch: null, kind: "decision", text: "a", vector: [1, 0], ts: "t" });
     insertEmbedding(db, { session: "s2", repo: null, branch: null, kind: "decision", text: "b", vector: [0, 1], ts: "t" });
     assert.equal(search(db, [1, 0], 1).length, 1);
+  });
+
+  test("filters embeddings by exclusive time window before ranking", () => {
+    insertEmbedding(db, {
+      session: "old",
+      repo: "/repo",
+      branch: "a",
+      kind: "decision",
+      text: "best but too old",
+      vector: [1, 0],
+      ts: "2026-01-01T00:00:00.000Z",
+    });
+    insertEmbedding(db, {
+      session: "inside",
+      repo: "/repo",
+      branch: "b",
+      kind: "decision",
+      text: "inside window",
+      vector: [0.8, 0.2],
+      ts: "2026-01-02T00:00:00.000Z",
+    });
+    insertEmbedding(db, {
+      session: "after",
+      repo: "/repo",
+      branch: "c",
+      kind: "decision",
+      text: "boundary excluded",
+      vector: [1, 0],
+      ts: "2026-01-03T00:00:00.000Z",
+    });
+
+    const hits = search(db, [1, 0], {
+      since: "2026-01-02T00:00:00.000Z",
+      until: "2026-01-03T00:00:00.000Z",
+      limit: 8,
+    });
+
+    assert.deepEqual(hits.map((h) => h.session), ["inside"]);
   });
 });
 
@@ -239,6 +295,20 @@ describe("grepTurns", () => {
     msg({ session: "s1", ts: "t1", branch: null, text: "shared keyword one" });
     msg({ session: "s2", ts: "t2", branch: null, text: "shared keyword two" });
     assert.equal(grepTurns(db, "shared keyword", 1).length, 1);
+  });
+
+  test("filters turns by exclusive time window", () => {
+    msg({ session: "old", ts: "2026-01-01T00:00:00.000Z", branch: null, text: "shared keyword old" });
+    msg({ session: "inside", ts: "2026-01-02T00:00:00.000Z", branch: null, text: "shared keyword inside" });
+    msg({ session: "after", ts: "2026-01-03T00:00:00.000Z", branch: null, text: "shared keyword after" });
+
+    const hits = grepTurns(db, "shared keyword", {
+      since: "2026-01-02T00:00:00.000Z",
+      until: "2026-01-03T00:00:00.000Z",
+      limit: 8,
+    });
+
+    assert.deepEqual(hits.map((h) => h.session), ["inside"]);
   });
 });
 

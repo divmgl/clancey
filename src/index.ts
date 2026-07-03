@@ -30,6 +30,7 @@ import { embedOne } from "./embeddings.js";
 import { runHook } from "./hook.js";
 import { setup, backfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
+import { resolveTimeFilter } from "./time.js";
 
 function getServerVersion(): string {
   try {
@@ -202,6 +203,8 @@ function buildServer(db: Store): Server {
             branch: { type: "string", description: "Exact branch name, e.g. a PR head ref" },
             file: { type: "string", description: "Substring of an edited file path" },
             since: { type: "string", description: "ISO timestamp lower bound" },
+            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
+            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
             limit: { type: "number", description: "Max work items (default: all)" },
           },
         },
@@ -213,7 +216,10 @@ function buildServer(db: Store): Server {
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Natural-language query" },
+            query: { type: "string", description: "Natural-language semantic query, without date/window words when using time filters" },
+            since: { type: "string", description: "ISO timestamp lower bound" },
+            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
+            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
             limit: { type: "number", description: "Max results (default: 8)" },
           },
           required: ["query"],
@@ -226,7 +232,10 @@ function buildServer(db: Store): Server {
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Keywords to match (turns matching any word surface, ranked by relevance)" },
+            query: { type: "string", description: "Keywords to match, without date/window words when using time filters" },
+            since: { type: "string", description: "ISO timestamp lower bound" },
+            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
+            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
             limit: { type: "number", description: "Max results (default: 8)" },
           },
           required: ["query"],
@@ -317,11 +326,17 @@ function buildServer(db: Store): Server {
           return text(`Removed learning #${id}.`);
         }
         case "recall": {
+          const time = resolveTimeFilter({
+            time: args.time as string | undefined,
+            since: args.since as string | undefined,
+            until: args.until as string | undefined,
+          });
+          if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
           const items = recall(db, {
             repo: args.repo as string | undefined,
             branch: args.branch as string | undefined,
             file: args.file as string | undefined,
-            since: args.since as string | undefined,
+            ...time.filter,
             limit: args.limit as number | undefined,
           });
           return text(formatWorkItems(items));
@@ -329,8 +344,14 @@ function buildServer(db: Store): Server {
         case "search": {
           const query = args.query as string;
           if (!query) return { ...text("Error: query is required"), isError: true };
+          const time = resolveTimeFilter({
+            time: args.time as string | undefined,
+            since: args.since as string | undefined,
+            until: args.until as string | undefined,
+          });
+          if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
           const vector = await embedOne(query);
-          const hits = search(db, vector, (args.limit as number) ?? 8);
+          const hits = search(db, vector, { limit: (args.limit as number) ?? 8, ...time.filter });
           let out = formatSearchHits(hits);
           const top = hits[0]?.score ?? 0;
           if (top < LOW_CONFIDENCE) {
@@ -341,7 +362,13 @@ function buildServer(db: Store): Server {
         case "grep_turns": {
           const query = args.query as string;
           if (!query) return { ...text("Error: query is required"), isError: true };
-          return text(formatTurnHits(grepTurns(db, query, (args.limit as number) ?? 8)));
+          const time = resolveTimeFilter({
+            time: args.time as string | undefined,
+            since: args.since as string | undefined,
+            until: args.until as string | undefined,
+          });
+          if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
+          return text(formatTurnHits(grepTurns(db, query, { limit: (args.limit as number) ?? 8, ...time.filter })));
         }
         case "read_turns": {
           const session = args.session as string;
