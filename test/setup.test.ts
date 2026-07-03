@@ -3,7 +3,22 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { configureOpencode, configureOpencodePlugin, renderOpencodePlugin } from "../src/setup.ts";
+import { configureOpencode, configureOpencodePlugin, renderCodexMcpBlock, renderOpencodePlugin } from "../src/setup.ts";
+
+describe("renderCodexMcpBlock", () => {
+  test("uses a direct node entrypoint instead of an npm launcher", () => {
+    const block = renderCodexMcpBlock("/tmp/clancey/dist/index.js", "/usr/local/bin/node");
+
+    assert.equal(
+      block,
+      `[mcp_servers.clancey]
+command = "/usr/local/bin/node"
+args = ["/tmp/clancey/dist/index.js"]
+`,
+    );
+    assert.doesNotMatch(block, /npx|npm/);
+  });
+});
 
 describe("configureOpencode", () => {
   let tmp: string;

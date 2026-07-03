@@ -3,6 +3,7 @@ import path from "path";
 import os from "os";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { fileURLToPath } from "url";
 import { intro, outro, log as clog, spinner, confirm, multiselect, isCancel, cancel } from "@clack/prompts";
 
 const execFileAsync = promisify(execFile);
@@ -228,6 +229,24 @@ interface HookGroup {
 
 const CODEX_CONFIG = path.join(os.homedir(), ".codex", "config.toml");
 
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function currentEntrypoint(): string {
+  const bin = process.argv[1];
+  return fs.realpathSync(bin || fileURLToPath(import.meta.url));
+}
+
+export function renderCodexMcpBlock(entrypoint: string = currentEntrypoint(), node: string = process.execPath): string {
+  return [
+    "[mcp_servers.clancey]",
+    `command = ${tomlString(node)}`,
+    `args = [${[entrypoint].map(tomlString).join(", ")}]`,
+    "",
+  ].join("\n");
+}
+
 /** OpenCode's config dir, XDG-aware: $XDG_CONFIG_HOME/opencode (falls back to ~/.config). */
 function opencodeConfigDir(): string {
   const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
@@ -436,11 +455,11 @@ export function configureOpencode(spec: string): { result: "added" | "updated"; 
   return { result: had ? "updated" : "added", file };
 }
 
-/** Add (or re-pin) the clancey MCP server in Codex's config.toml, idempotently. */
-function configureCodex(spec: string): "added" | "updated" {
+/** Add (or refresh) the clancey MCP server in Codex's config.toml, idempotently. */
+function configureCodex(): "added" | "updated" {
   const existing = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, "utf-8") : "";
   const had = existing.includes("[mcp_servers.clancey]");
-  const block = `[mcp_servers.clancey]\ncommand = "npx"\nargs = ["-y", "${spec}"]\n`;
+  const block = renderCodexMcpBlock();
 
   // Strip any existing clancey block so re-runs re-pin the version instead of duplicating.
   const stripped = existing.replace(/\[mcp_servers\.clancey\][\s\S]*?(?=\n\[|$)/, "").replace(/\n{3,}/g, "\n\n").trim();
@@ -584,11 +603,11 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: Target[] } 
   }
 
   if (targets.includes("codex")) {
-    const codex = configureCodex(spec);
+    const codex = configureCodex();
     clog.success(
       codex === "added"
-        ? `Registered Codex MCP server (${spec}) in ${tildify(CODEX_CONFIG)}`
-        : `Re-pinned Codex MCP server to ${spec} in ${tildify(CODEX_CONFIG)}`,
+        ? `Registered Codex MCP server from this clancey install (${spec}) in ${tildify(CODEX_CONFIG)}`
+        : `Refreshed Codex MCP server for this clancey install (${spec}) in ${tildify(CODEX_CONFIG)}`,
     );
   }
 
