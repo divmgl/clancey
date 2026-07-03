@@ -395,6 +395,17 @@ export async function parseTranscript(filePath: string, attribution?: ParseAttri
 /** Codex command tools, across versions: `shell` (array cmd), `exec_command`/`shell_command` (string cmd). */
 const CODEX_COMMAND_TOOLS = new Set(["shell", "exec_command", "shell_command"]);
 
+export interface CodexParseState {
+  cwd: string | null;
+  branch: string | null;
+}
+
+interface CodexLineParsed {
+  toolEvents: ToolEvent[];
+  userTurn: UserTurn | null;
+  message: ConvMessage | null;
+}
+
 /** Codex injects AGENTS.md and environment context as user messages — not human turns. */
 function isCodexBoilerplate(text: string): boolean {
   return (
@@ -414,90 +425,124 @@ function extractPatchFiles(text: string): string[] {
   return files;
 }
 
+export function parseCodexJsonlLine(line: string, state: CodexParseState): CodexLineParsed {
+  const empty = { toolEvents: [], userTurn: null, message: null };
+  if (!line.trim()) return empty;
+
+  let obj: {
+    type?: string;
+    timestamp?: unknown;
+    payload?: {
+      type?: string;
+      role?: string;
+      name?: string;
+      arguments?: unknown;
+      input?: unknown;
+      content?: unknown;
+      cwd?: unknown;
+      git?: { branch?: unknown };
+    };
+  };
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return empty;
+  }
+
+  if (obj.type === "session_meta") {
+    if (typeof obj.payload?.cwd === "string") state.cwd = obj.payload.cwd;
+    if (typeof obj.payload?.git?.branch === "string") state.branch = obj.payload.git.branch;
+    return empty;
+  }
+  if (obj.type !== "response_item") return empty;
+
+  const p = obj.payload;
+  const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "";
+
+  if (p?.type === "message" && p.role === "user") {
+    const text = extractTextContent(p.content);
+    if (!text || isNoiseUserText(text) || isCodexBoilerplate(text)) return empty;
+    const userTurn = { text, branch: state.branch, timestamp };
+    return {
+      toolEvents: [],
+      userTurn,
+      message: { role: "user", agent: null, agentId: null, branch: state.branch, timestamp, text },
+    };
+  }
+
+  if (p?.type === "message" && p.role === "assistant") {
+    const text = extractTextContent(p.content);
+    return {
+      toolEvents: [],
+      userTurn: null,
+      message: text ? { role: "assistant", agent: null, agentId: null, branch: state.branch, timestamp, text } : null,
+    };
+  }
+
+  if (p?.type === "function_call" && typeof p.name === "string" && CODEX_COMMAND_TOOLS.has(p.name)) {
+    let command: string | null = null;
+    let workdir: string | null = null;
+    try {
+      const args = (typeof p.arguments === "string" ? JSON.parse(p.arguments) : p.arguments) as {
+        command?: unknown;
+        cmd?: unknown;
+        workdir?: unknown;
+      };
+      if (Array.isArray(args?.command)) command = args.command.join(" ");
+      else if (typeof args?.command === "string") command = args.command;
+      else if (typeof args?.cmd === "string") command = args.cmd;
+      if (typeof args?.workdir === "string") workdir = args.workdir;
+    } catch {
+      command = null;
+    }
+    if (!command) return empty;
+
+    const evCwd = workdir ?? state.cwd;
+    const toolEvents: ToolEvent[] = [{ tool: p.name, file: null, command, branch: state.branch, cwd: evCwd, timestamp }];
+    for (const file of extractPatchFiles(command)) {
+      toolEvents.push({ tool: "apply_patch", file, command: null, branch: state.branch, cwd: evCwd, timestamp });
+    }
+    return { toolEvents, userTurn: null, message: null };
+  }
+
+  if (p?.type === "custom_tool_call" && p.name === "apply_patch") {
+    const patch = typeof p.input === "string" ? p.input : "";
+    return {
+      toolEvents: extractPatchFiles(patch).map((file) => ({
+        tool: "apply_patch",
+        file,
+        command: null,
+        branch: state.branch,
+        cwd: state.cwd,
+        timestamp,
+      })),
+      userTurn: null,
+      message: null,
+    };
+  }
+
+  return empty;
+}
+
 /**
  * Parse a Codex session transcript. Repo + branch come from `session_meta` (one per
  * session); file/command events come from `shell` function calls (and the apply_patch
- * bodies inside them). Codex has no hook, so this is backfill-only.
+ * bodies inside them).
  */
 export async function parseCodexTranscript(filePath: string): Promise<ParsedTranscript> {
   const sessionId = path.basename(filePath, ".jsonl");
   const toolEvents: ToolEvent[] = [];
   const userTurns: UserTurn[] = [];
   const messages: ConvMessage[] = [];
-  let cwd: string | null = null;
-  let branch: string | null = null;
+  const state: CodexParseState = { cwd: null, branch: null };
 
   const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
 
   for await (const line of rl) {
-    if (!line.trim()) continue;
-    let obj: {
-      type?: string;
-      timestamp?: unknown;
-      payload?: {
-        type?: string;
-        role?: string;
-        name?: string;
-        arguments?: unknown;
-        input?: unknown;
-        content?: unknown;
-        cwd?: unknown;
-        git?: { branch?: unknown };
-      };
-    };
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    if (obj.type === "session_meta") {
-      if (typeof obj.payload?.cwd === "string") cwd = obj.payload.cwd;
-      if (typeof obj.payload?.git?.branch === "string") branch = obj.payload.git.branch;
-      continue;
-    }
-    if (obj.type !== "response_item") continue;
-
-    const p = obj.payload;
-    const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "";
-
-    if (p?.type === "message" && p.role === "user") {
-      const text = extractTextContent(p.content);
-      if (!text || isNoiseUserText(text) || isCodexBoilerplate(text)) continue;
-      userTurns.push({ text, branch, timestamp });
-      messages.push({ role: "user", agent: null, agentId: null, branch, timestamp, text });
-    } else if (p?.type === "message" && p.role === "assistant") {
-      const text = extractTextContent(p.content);
-      if (text) messages.push({ role: "assistant", agent: null, agentId: null, branch, timestamp, text });
-    } else if (p?.type === "function_call" && typeof p.name === "string" && CODEX_COMMAND_TOOLS.has(p.name)) {
-      let command: string | null = null;
-      let workdir: string | null = null;
-      try {
-        const args = (typeof p.arguments === "string" ? JSON.parse(p.arguments) : p.arguments) as {
-          command?: unknown;
-          cmd?: unknown;
-          workdir?: unknown;
-        };
-        if (Array.isArray(args?.command)) command = args.command.join(" ");
-        else if (typeof args?.command === "string") command = args.command;
-        else if (typeof args?.cmd === "string") command = args.cmd;
-        if (typeof args?.workdir === "string") workdir = args.workdir;
-      } catch {
-        command = null;
-      }
-      if (command) {
-        const evCwd = workdir ?? cwd;
-        toolEvents.push({ tool: p.name, file: null, command, branch, cwd: evCwd, timestamp });
-        for (const file of extractPatchFiles(command)) {
-          toolEvents.push({ tool: "apply_patch", file, command: null, branch, cwd: evCwd, timestamp });
-        }
-      }
-    } else if (p?.type === "custom_tool_call" && p.name === "apply_patch") {
-      const patch = typeof p.input === "string" ? p.input : "";
-      for (const file of extractPatchFiles(patch)) {
-        toolEvents.push({ tool: "apply_patch", file, command: null, branch, cwd, timestamp });
-      }
-    }
+    const parsed = parseCodexJsonlLine(line, state);
+    toolEvents.push(...parsed.toolEvents);
+    if (parsed.userTurn) userTurns.push(parsed.userTurn);
+    if (parsed.message) messages.push(parsed.message);
   }
 
   return { sessionId, title: null, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };

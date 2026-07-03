@@ -31,6 +31,7 @@ import { runHook } from "./hook.js";
 import { setup, backfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import { resolveTimeFilter } from "./time.js";
+import { startCodexLiveCapture } from "./codex-live.js";
 
 function getServerVersion(): string {
   try {
@@ -426,6 +427,7 @@ function buildServer(db: Store): Server {
 
 async function runServer(): Promise<void> {
   const db = openStore();
+  startCodexLiveCapture(db);
   const server = buildServer(db);
   const transport = new StdioServerTransport();
   await server.connect(transport);
