@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "1.9.1",
+  "version": "2.0.0",
   "description": "A memory for your AI coding sessions: map a branch or file to the conversations that produced it across Claude Code, Grok Build, OpenCode, and Codex",
   "type": "module",
   "main": "dist/index.js",
