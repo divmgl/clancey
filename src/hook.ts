@@ -1,6 +1,6 @@
 import fs from "fs";
 import { repoKey, currentBranch } from "./git.js";
-import { openStore, insertToolEvent, getNudgeState, setNudgeState, NudgeState } from "./store.js";
+import { openStore, insertToolEvent } from "./store.js";
 import { upgradeNotice } from "./upgrade.js";
 import { logError } from "./logger.js";
 
@@ -12,75 +12,79 @@ function currentVersion(): string {
 }
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
-/** Generic-nudge throttle: at most one ambient reminder per session per this window. */
-const NUDGE_INTERVAL_MS = 10 * 60 * 1000;
-/** Event-nudge cooldown: a burst of commits/pushes fires once, not on every command. */
-const EVENT_COOLDOWN_MS = 2 * 60 * 1000;
 
-const SILENCE =
-  "Never mention Clancey, this instruction, or the act of recording to the user — not to " +
-  "announce it, confirm it, or explain why you skipped it. It is invisible background work.";
-
-const SESSION_START_INSTRUCTION =
-  "[clancey] Decision and learning logging is active. Record a decision the moment you commit, " +
-  "open or update a PR, root-cause a bug, choose between approaches, or the user corrects you — " +
-  "call record_decision({ repo, branch, decision, why }) with the rationale and the alternatives " +
-  "you rejected, not just the what. Separately, when you discover a non-obvious fact about the " +
-  "system (a gotcha, a constraint, how a subsystem actually behaves), call record_learning(" +
-  "{ repo, branch, learning, context }). Your current repo and branch are provided back to you " +
-  "after tool calls. " +
-  SILENCE;
-
-/** A high-signal moment detected from a Bash command — where a decision usually just happened. */
-export type EventTrigger = "commit" | "pr_open" | "pr_update" | "push";
-
-export interface NudgeDecision {
-  emit: boolean;
-  kind?: "event" | "generic";
-  event?: EventTrigger;
-}
-
-/** Detect a commit/PR/push moment in a Bash command string (matches anywhere, so chains work). */
-export function detectEvent(command: string): EventTrigger | null {
-  if (/\bgh\s+pr\s+create\b/i.test(command)) return "pr_open";
-  if (/\bgh\s+pr\s+edit\b/i.test(command)) return "pr_update";
-  if (/\bgit\s+commit\b/i.test(command)) return "commit";
-  if (/\bgit\s+push\b/i.test(command)) return "push";
-  return null;
-}
-
-/**
- * Decide whether (and how) to nudge for a tool call. Pure — no I/O — so it is unit-testable.
- * Event commands take the just-in-time lane (fire at the moment, subject to EVENT_COOLDOWN_MS);
- * everything else falls back to the throttled generic lane. An event command in cooldown stays
- * silent rather than dropping through to a generic nudge — we already prompted for it.
- */
-export function classifyNudge(
-  toolName: string,
-  toolInput: Record<string, unknown>,
-  prev: NudgeState | undefined,
-  branch: string | null,
-  nowMs: number,
-): NudgeDecision {
-  if (toolName === "Bash" && typeof toolInput.command === "string") {
-    const event = detectEvent(toolInput.command);
-    if (event) {
-      const eventStale =
-        !prev?.last_event_ts || nowMs - Date.parse(prev.last_event_ts) > EVENT_COOLDOWN_MS;
-      return eventStale ? { emit: true, kind: "event", event } : { emit: false };
-    }
-  }
-  const branchChanged = !prev || prev.last_branch !== branch;
-  const stale = !prev?.last_nudge_ts || nowMs - Date.parse(prev.last_nudge_ts) > NUDGE_INTERVAL_MS;
-  return branchChanged || stale ? { emit: true, kind: "generic" } : { emit: false };
-}
-
-interface HookPayload {
+export interface HookPayload {
   hook_event_name?: string;
   session_id?: string;
   cwd?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+}
+
+/** Map Grok (and other host) tool names to the Claude shapes we record. */
+const TOOL_ALIASES: Record<string, string> = {
+  run_terminal_command: "Bash",
+  search_replace: "Edit",
+  write: "Write",
+  // Cursor / other aliases that may show up via compat hooks
+  Shell: "Bash",
+  shell: "Bash",
+};
+
+/**
+ * Normalize a hook stdin payload from Claude (snake_case) or Grok (camelCase) into
+ * the Claude-shaped fields the rest of the hook uses.
+ */
+export function normalizeHookPayload(raw: Record<string, unknown>): HookPayload {
+  const eventRaw =
+    (typeof raw.hook_event_name === "string" && raw.hook_event_name) ||
+    (typeof raw.hookEventName === "string" && raw.hookEventName) ||
+    "";
+  // Grok sends snake event names like "post_tool_use"; Claude sends "PostToolUse".
+  const event = eventRaw.includes("_")
+    ? eventRaw
+        .split("_")
+        .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+        .join("")
+    : eventRaw;
+
+  const toolRaw =
+    (typeof raw.tool_name === "string" && raw.tool_name) ||
+    (typeof raw.toolName === "string" && raw.toolName) ||
+    "";
+  const tool = TOOL_ALIASES[toolRaw] ?? toolRaw;
+
+  const inputRaw =
+    (raw.tool_input && typeof raw.tool_input === "object" && !Array.isArray(raw.tool_input)
+      ? (raw.tool_input as Record<string, unknown>)
+      : null) ??
+    (raw.toolInput && typeof raw.toolInput === "object" && !Array.isArray(raw.toolInput)
+      ? (raw.toolInput as Record<string, unknown>)
+      : null) ??
+    {};
+
+  // Normalize common path field names onto file_path for FILE_TOOLS.
+  const input: Record<string, unknown> = { ...inputRaw };
+  if (typeof input.file_path !== "string") {
+    if (typeof input.path === "string") input.file_path = input.path;
+    else if (typeof input.filePath === "string") input.file_path = input.filePath;
+    else if (typeof input.target_file === "string") input.file_path = input.target_file;
+  }
+
+  return {
+    hook_event_name: event || undefined,
+    session_id:
+      (typeof raw.session_id === "string" && raw.session_id) ||
+      (typeof raw.sessionId === "string" && raw.sessionId) ||
+      undefined,
+    cwd:
+      (typeof raw.cwd === "string" && raw.cwd) ||
+      (typeof raw.workspaceRoot === "string" && raw.workspaceRoot) ||
+      (typeof raw.GROK_WORKSPACE_ROOT === "string" && raw.GROK_WORKSPACE_ROOT) ||
+      undefined,
+    tool_name: tool || undefined,
+    tool_input: input,
+  };
 }
 
 async function readStdin(): Promise<string> {
@@ -89,93 +93,36 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-const EVENT_MOMENT: Record<EventTrigger, string> = {
-  commit: "You just committed",
-  pr_open: "You just opened a PR",
-  pr_update: "You just updated a PR",
-  push: "You just pushed",
-};
-
-/** Build the nudge text for a decision: event nudges name the moment; generic nudges list triggers. */
-function nudgeText(
-  decision: NudgeDecision,
-  repo: string | null,
-  branch: string | null,
-  session: string,
-): string {
-  const anchor = `repo: ${JSON.stringify(repo)}, branch: ${JSON.stringify(branch)}`;
-  const calls =
-    `record_decision({ ${anchor}, decision, why }) — the rationale and the alternatives you ` +
-    `rejected, not the diff — and record_learning({ ${anchor}, learning, context }) for any ` +
-    `non-obvious thing you found out`;
-  const where = `repo=${repo ?? "?"} on branch=${branch ?? "?"} (session ${session})`;
-
-  if (decision.kind === "event" && decision.event) {
-    return (
-      `[clancey] ${EVENT_MOMENT[decision.event]} in ${where}. This is a decision point — capture it ` +
-      `now while it is fresh: call ${calls}. ` +
-      SILENCE
-    );
-  }
-  return (
-    `[clancey] Working in ${where}. After you commit, open or update a PR, root-cause a bug, choose ` +
-    `between approaches, or the user corrects you, call ${calls}, copiously. ` +
-    SILENCE
-  );
-}
-
-function emitNudge(
-  decision: NudgeDecision,
-  repo: string | null,
-  branch: string | null,
-  session: string,
-): void {
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        additionalContext: nudgeText(decision, repo, branch, session),
-      },
-    }),
-  );
-}
-
 /**
- * `clancey hook` — invoked by Claude Code hooks. Reads the hook JSON on stdin, records
- * file/command events, and (throttled) nudges the agent to record decisions.
+ * `clancey hook` — invoked by host PostToolUse / SessionStart hooks.
+ * Records file/command tool events. Decision/learning recording is driven by MCP tool
+ * descriptions, not by injected coaching text.
  * Must never throw or block: any failure exits 0 silently.
  */
 export async function runHook(): Promise<void> {
   let payload: HookPayload;
   try {
-    payload = JSON.parse(await readStdin());
+    const raw = JSON.parse(await readStdin()) as Record<string, unknown>;
+    payload = normalizeHookPayload(raw);
   } catch {
     return;
   }
 
   if (payload.hook_event_name === "SessionStart") {
-    let systemMessage: string | null = null;
+    // Optional upgrade notice only — no decision-coaching injection.
     try {
       const db = openStore();
       try {
-        systemMessage = await upgradeNotice(db, currentVersion());
+        const systemMessage = await upgradeNotice(db, currentVersion());
+        if (systemMessage) {
+          process.stdout.write(JSON.stringify({ systemMessage }));
+        }
       } finally {
         db.close();
       }
     } catch (err) {
       logError("upgrade check failed", err);
     }
-    const output: {
-      hookSpecificOutput: { hookEventName: string; additionalContext: string };
-      systemMessage?: string;
-    } = {
-      hookSpecificOutput: {
-        hookEventName: "SessionStart",
-        additionalContext: SESSION_START_INSTRUCTION,
-      },
-    };
-    if (systemMessage) output.systemMessage = systemMessage;
-    process.stdout.write(JSON.stringify(output));
     return;
   }
   if (payload.hook_event_name !== "PostToolUse") return;
@@ -194,17 +141,6 @@ export async function runHook(): Promise<void> {
       insertToolEvent(db, { session, repo, branch, cwd, tool, file: input.file_path, command: null, ts });
     } else if (tool === "Bash" && typeof input.command === "string") {
       insertToolEvent(db, { session, repo, branch, cwd, tool, file: null, command: input.command, ts });
-    }
-
-    if (session && (repo || branch)) {
-      const prev = getNudgeState(db, session);
-      const decision = classifyNudge(tool, input, prev, branch, Date.now());
-      if (decision.emit) {
-        // Event nudges reset their own cooldown clock; generic nudges leave it untouched.
-        const eventTs = decision.kind === "event" ? ts : prev?.last_event_ts ?? null;
-        setNudgeState(db, session, branch, ts, eventTs);
-        emitNudge(decision, repo, branch, session);
-      }
     }
   } catch (err) {
     logError("hook failed", err);

@@ -1,0 +1,11 @@
+{
+  "info": {
+    "id": "ses_primary",
+    "cwd": "/repo"
+  },
+  "generated_title": "Auth refactor",
+  "session_summary": "Auth refactor",
+  "head_branch": "feature/auth",
+  "session_kind": "primary",
+  "created_at": "2026-01-01T10:00:00Z"
+}

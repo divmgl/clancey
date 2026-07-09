@@ -1,6 +1,6 @@
 # Clancey
 
-A memory for AI coding sessions. An MCP server (plus a thin operational CLI) that records what Claude Code / Codex sessions did and the decisions made, so the agent can map a branch or file back to the conversation that produced it.
+A memory for AI coding sessions. An MCP server (plus a thin operational CLI) that records what Claude Code, Grok Build, OpenCode, and Codex sessions did and the decisions made, so the agent can map a branch or file back to the conversation that produced it.
 
 ## Workflow — commit straight to `main`
 

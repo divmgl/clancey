@@ -112,12 +112,12 @@ function buildServer(db: Store): Server {
       {
         name: "record_decision",
         description:
-          "Record a significant decision and its rationale, anchored to the current repo and branch. Call this copiously as you work — capture the why and the alternatives rejected, not just what changed.",
+          "Record a significant decision and its rationale, anchored to the current repo and branch. Call this copiously as you work — after commits, PRs, root-causing bugs, choosing between approaches, or when the user corrects you. Capture the why and the alternatives rejected, not just what changed.",
         inputSchema: {
           type: "object",
           properties: {
-            repo: { type: "string", description: "Repo key (provided in the clancey hook context)" },
-            branch: { type: "string", description: "Branch (provided in the clancey hook context)" },
+            repo: { type: "string", description: "Repo key (e.g. owner/name from git remote, or absolute path)" },
+            branch: { type: "string", description: "Current git branch" },
             decision: { type: "string", description: "What was decided" },
             why: { type: "string", description: "Rationale and alternatives rejected" },
             files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
@@ -158,8 +158,8 @@ function buildServer(db: Store): Server {
         inputSchema: {
           type: "object",
           properties: {
-            repo: { type: "string", description: "Repo key (provided in the clancey hook context)" },
-            branch: { type: "string", description: "Branch (provided in the clancey hook context)" },
+            repo: { type: "string", description: "Repo key (e.g. owner/name from git remote, or absolute path)" },
+            branch: { type: "string", description: "Current git branch" },
             learning: { type: "string", description: "What you learned" },
             context: { type: "string", description: "Where it applies and why it matters" },
             files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
@@ -434,14 +434,16 @@ async function runServer(): Promise<void> {
   log(`MCP server running. Logs: ${LOG_FILE}`);
 }
 
-const HELP = `clancey — a memory for your Claude Code conversations
+const HELP = `clancey — a memory for your AI coding sessions
 
 Usage:
-  clancey                 Start the MCP server over stdio (how Claude Code runs it)
+  clancey                 Start the MCP server over stdio
   clancey setup           Wire hooks + MCP globally, clean legacy index, backfill
   clancey backfill        Ingest existing transcripts into the store
   clancey prune           Drop conversation history older than the retention window
-  clancey hook            Internal: invoked by Claude Code hooks (reads stdin)
+  clancey hook            Internal: invoked by host hooks (reads stdin)
+
+Supports Claude Code, Codex, OpenCode, and Grok Build.
 
 Run "clancey <command> --help" for command-specific options.`;
 
@@ -459,14 +461,17 @@ Options:
 
 const SETUP_HELP = `clancey setup — wire clancey into your AI coding tools (global, idempotent)
 
-For Claude Code: adds PostToolUse + SessionStart hooks to ~/.claude/settings.json and
-registers the MCP server at user scope. For OpenCode: registers the MCP server and writes a
-live-recording plugin to ~/.config/opencode/plugins/. For Codex: registers the MCP server
-(backfill-only). Then offers to remove the legacy v1 index and backfills existing conversations.
+Claude Code: PostToolUse + SessionStart hooks in ~/.claude/settings.json and MCP at user scope.
+OpenCode: MCP server + live-recording plugin under ~/.config/opencode/.
+Codex: MCP server in ~/.codex/config.toml (history import + live tool poller).
+Grok Build: MCP server in ~/.grok/config.toml + live-recording hooks under ~/.grok/hooks/.
+
+Then offers to remove the legacy v1 index and backfills existing conversations from every
+detected host.
 
 Options:
   --tools <list>              Comma-separated tools to set up, non-interactively:
-                              claude, codex, opencode, or all (e.g. --tools opencode).
+                              claude, codex, opencode, grok, or all (e.g. --tools grok).
                               Skips the picker. Default is the interactive picker; with
                               no TTY, all detected tools.
   --clean-legacy, --yes, -y   Delete the legacy v1 index (~/.clancey/conversations.lance)
@@ -500,14 +505,14 @@ function parseDays(args: string[]): number | undefined {
   return n;
 }
 
-/** Parse `--tools claude,codex,opencode` (or `--tools=all`) into an explicit target list. */
+/** Parse `--tools claude,codex,opencode,grok` (or `--tools=all`) into an explicit target list. */
 function parseTools(args: string[]): Target[] | undefined {
   const eq = args.find((a) => a.startsWith("--tools="));
   const idx = args.indexOf("--tools");
   const raw = eq ? eq.slice("--tools=".length) : idx !== -1 ? args[idx + 1] : undefined;
   if (raw === undefined) return undefined;
 
-  const all: Target[] = ["claude", "codex", "opencode"];
+  const all: Target[] = ["claude", "codex", "opencode", "grok"];
   const out = new Set<Target>();
   for (const part of raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
     if (part === "all") {
@@ -515,7 +520,7 @@ function parseTools(args: string[]): Target[] | undefined {
     } else if ((all as string[]).includes(part)) {
       out.add(part as Target);
     } else {
-      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, opencode, all)`);
+      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, opencode, grok, all)`);
       process.exit(1);
     }
   }

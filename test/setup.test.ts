@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { configureOpencode, configureOpencodePlugin, renderCodexMcpBlock, renderOpencodePlugin } from "../src/setup.ts";
+import {
+  configureOpencode,
+  configureOpencodePlugin,
+  configureGrok,
+  configureGrokHooks,
+  renderCodexMcpBlock,
+  renderGrokMcpBlock,
+  renderOpencodePlugin,
+} from "../src/setup.ts";
 
 describe("renderCodexMcpBlock", () => {
   test("uses a direct node entrypoint instead of an npm launcher", () => {
@@ -91,20 +99,76 @@ describe("configureOpencode", () => {
 });
 
 describe("renderOpencodePlugin", () => {
-  test("bakes in the pinned spec and is valid ESM exposing the parity hooks", () => {
+  test("bakes in the pinned spec and records tools without coaching injection", () => {
     const src = renderOpencodePlugin("clancey@3.1.4");
     // The spec is pinned (used as the npx arg, JSON-quoted).
     assert.match(src, /const SPEC = "clancey@3\.1\.4";/);
     assert.match(src, /export const ClanceyPlugin = async/);
-    // The two injection points that give Claude Code parity.
-    assert.match(src, /"experimental\.chat\.system\.transform"/);
+    // Live tool recording only — no system-prompt coaching path.
     assert.match(src, /"tool\.execute\.after"/);
-    // Bridges to the same hook CLI with the Claude-shaped event names.
-    assert.match(src, /"SessionStart"/);
+    assert.doesNotMatch(src, /experimental\.chat\.system\.transform/);
     assert.match(src, /"PostToolUse"/);
     // Maps OpenCode tool names to the Claude shapes the hook understands.
     assert.match(src, /tool === "bash"/);
     assert.match(src, /tool === "write" \? "Write" : "Edit"/);
+  });
+});
+
+describe("renderGrokMcpBlock", () => {
+  test("pins clancey via npx for Grok's config.toml", () => {
+    const block = renderGrokMcpBlock("clancey@1.9.1");
+    assert.equal(
+      block,
+      `[mcp_servers.clancey]
+command = "npx"
+args = ["-y", "clancey@1.9.1"]
+enabled = true
+`,
+    );
+  });
+});
+
+describe("configureGrok", () => {
+  let tmp: string;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-grok-"));
+    prevHome = process.env.GROK_HOME;
+    process.env.GROK_HOME = tmp;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = prevHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("creates config.toml with the pinned MCP server", () => {
+    const result = configureGrok("clancey@9.9.9");
+    assert.equal(result, "added");
+    const raw = fs.readFileSync(path.join(tmp, "config.toml"), "utf-8");
+    assert.match(raw, /\[mcp_servers\.clancey\]/);
+    assert.match(raw, /clancey@9\.9\.9/);
+  });
+
+  test("re-pins idempotently without duplicating the block", () => {
+    configureGrok("clancey@1.0.0");
+    assert.equal(configureGrok("clancey@2.0.0"), "updated");
+    const raw = fs.readFileSync(path.join(tmp, "config.toml"), "utf-8");
+    assert.match(raw, /clancey@2\.0\.0/);
+    assert.doesNotMatch(raw, /clancey@1\.0\.0/);
+    assert.equal((raw.match(/\[mcp_servers\.clancey\]/g) ?? []).length, 1);
+  });
+
+  test("writes live-recording hooks under hooks/clancey.json", () => {
+    const { result, file } = configureGrokHooks("clancey@3.0.0");
+    assert.equal(result, "added");
+    assert.equal(file, path.join(tmp, "hooks", "clancey.json"));
+    const body = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.ok(body.hooks.PostToolUse);
+    assert.ok(body.hooks.SessionStart);
+    assert.match(body.hooks.PostToolUse[0].hooks[0].command, /clancey@3\.0\.0 hook/);
   });
 });
 

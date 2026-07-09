@@ -6,6 +6,7 @@ import {
   parseTranscript,
   parseCodexTranscript,
   parseOpencodeTranscript,
+  parseGrokTranscript,
   listSubagents,
   parseSubagent,
 } from "../src/parser.ts";
@@ -226,5 +227,52 @@ describe("parseOpencodeTranscript", () => {
       "timestamps are ISO strings",
     );
     assert.ok(t.messages.every((m) => m.agent === null && m.agentId === null));
+  });
+});
+
+describe("parseGrokTranscript", () => {
+  const fixture = path.join(import.meta.dirname, "fixtures", "grok", "ses_primary");
+
+  test("reads title, session id, branch, and cwd from summary.json", async () => {
+    const t = await parseGrokTranscript(fixture);
+    assert.equal(t.sessionId, "ses_primary");
+    assert.equal(t.title, "Auth refactor");
+    assert.equal(t.userTurns[0]?.branch, "feature/auth");
+  });
+
+  test("extracts edit/write file events and bash commands", async () => {
+    const t = await parseGrokTranscript(fixture);
+    assert.deepEqual(
+      t.toolEvents.map((e) => ({ tool: e.tool, file: e.file, command: e.command, branch: e.branch, cwd: e.cwd })),
+      [
+        { tool: "Edit", file: "/repo/src/auth.ts", command: null, branch: "feature/auth", cwd: "/repo" },
+        { tool: "Bash", file: null, command: "bun test", branch: "feature/auth", cwd: "/repo" },
+        { tool: "Write", file: "/repo/src/auth.test.ts", command: null, branch: "feature/auth", cwd: "/repo" },
+      ],
+    );
+  });
+
+  test("assembles consecutive message chunks; framing is the first human turn", async () => {
+    const t = await parseGrokTranscript(fixture);
+    assert.equal(
+      t.framing,
+      "We need to refactor the auth module because it is tangled and hard to test.",
+    );
+    assert.ok(
+      t.messages.some(
+        (m) => m.role === "assistant" && m.text.includes("I'll extract the token refresh path first.") && m.text.includes("Then add a unit test."),
+      ),
+      "agent chunks are joined",
+    );
+  });
+
+  test("attribution folds subagent turns under the parent session", async () => {
+    const t = await parseGrokTranscript(fixture, {
+      sessionId: "parent_session",
+      agent: "general-purpose",
+      agentId: "sub-1",
+    });
+    assert.equal(t.sessionId, "parent_session");
+    assert.ok(t.messages.every((m) => m.agent === "general-purpose" && m.agentId === "sub-1"));
   });
 });

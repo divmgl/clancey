@@ -71,7 +71,13 @@ export function getOpencodeStorageDir(): string {
   return path.join(dataHome, "opencode", "storage");
 }
 
-export type TranscriptKind = "claude" | "codex" | "opencode";
+/** Grok Build session root: $GROK_HOME/sessions, else ~/.grok/sessions. */
+export function getGrokSessionsDir(): string {
+  const grokHome = process.env.GROK_HOME || path.join(os.homedir(), ".grok");
+  return path.join(grokHome, "sessions");
+}
+
+export type TranscriptKind = "claude" | "codex" | "opencode" | "grok";
 
 export interface TranscriptRef {
   path: string;
@@ -244,7 +250,16 @@ export async function listSubagents(parentSessionFile: string): Promise<Subagent
 
 /** Parse a subagent transcript, folding it under the parent session with agent attribution. */
 export function parseSubagent(ref: SubagentRef): Promise<ParsedTranscript> {
-  return parseTranscript(ref.path, { sessionId: ref.parentSessionId, agent: ref.agentType, agentId: ref.agentId });
+  const attribution: ParseAttribution = {
+    sessionId: ref.parentSessionId,
+    agent: ref.agentType,
+    agentId: ref.agentId,
+  };
+  // Grok subagents are full session directories; Claude subagents are sibling .jsonl files.
+  if (!ref.path.endsWith(".jsonl")) {
+    return parseGrokTranscript(ref.path, attribution);
+  }
+  return parseTranscript(ref.path, attribution);
 }
 
 async function collectJsonl(dir: string, out: string[]): Promise<void> {
@@ -297,26 +312,30 @@ export async function listOpencodeFiles(): Promise<string[]> {
   return files;
 }
 
-/** Session id for a transcript ref — OpenCode files end in `.json`, the others in `.jsonl`. */
+/** Session id for a transcript ref — OpenCode files end in `.json`; Grok refs are session dirs. */
 export function sessionIdOf(ref: TranscriptRef): string {
-  return path.basename(ref.path, ref.kind === "opencode" ? ".json" : ".jsonl");
+  if (ref.kind === "opencode") return path.basename(ref.path, ".json");
+  if (ref.kind === "grok") return path.basename(ref.path);
+  return path.basename(ref.path, ".jsonl");
 }
 
-/** All ingestable transcripts across Claude Code, Codex, and OpenCode, tagged by kind. */
+/** All ingestable transcripts across Claude Code, Codex, OpenCode, and Grok Build, tagged by kind. */
 export async function listAllTranscripts(): Promise<TranscriptRef[]> {
-  const [claude, codex, opencode] = await Promise.all([
+  const [claude, codex, opencode, grok] = await Promise.all([
     listConversationFiles(),
     listCodexFiles(),
     listOpencodeFiles(),
+    listGrokFiles(),
   ]);
   return [
     ...claude.map((p): TranscriptRef => ({ path: p, kind: "claude" })),
     ...codex.map((p): TranscriptRef => ({ path: p, kind: "codex" })),
     ...opencode.map((p): TranscriptRef => ({ path: p, kind: "opencode" })),
+    ...grok.map((p): TranscriptRef => ({ path: p, kind: "grok" })),
   ];
 }
 
-/** Resolve a session id to its transcript (searches Claude, Codex, then OpenCode), or null. */
+/** Resolve a session id to its transcript (searches all supported hosts), or null. */
 export async function resolveSession(sessionId: string): Promise<TranscriptRef | null> {
   const all = await listAllTranscripts();
   return all.find((r) => sessionIdOf(r) === sessionId) ?? null;
@@ -691,5 +710,312 @@ export async function parseOpencodeTranscript(sessionFile: string): Promise<Pars
 export function parseAny(ref: TranscriptRef): Promise<ParsedTranscript> {
   if (ref.kind === "codex") return parseCodexTranscript(ref.path);
   if (ref.kind === "opencode") return parseOpencodeTranscript(ref.path);
+  if (ref.kind === "grok") return parseGrokTranscript(ref.path);
   return parseTranscript(ref.path);
+}
+
+// ─── Grok Build ──────────────────────────────────────────────────────────────
+
+const GROK_FILE_TOOLS = new Set(["search_replace", "write"]);
+const GROK_COMMAND_TOOLS = new Set(["run_terminal_command"]);
+
+/** Convert a Grok update timestamp (unix seconds or ms) to ISO, or "". */
+function grokTs(raw: unknown, metaMs?: unknown): string {
+  if (typeof metaMs === "number" && Number.isFinite(metaMs)) {
+    return new Date(metaMs).toISOString();
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const ms = raw > 1e12 ? raw : raw * 1000;
+    return new Date(ms).toISOString();
+  }
+  if (typeof raw === "string" && raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) {
+      const ms = n > 1e12 ? n : n * 1000;
+      return new Date(ms).toISOString();
+    }
+    const d = Date.parse(raw);
+    if (!Number.isNaN(d)) return new Date(d).toISOString();
+  }
+  return "";
+}
+
+/**
+ * Primary Grok sessions under ~/.grok/sessions/<encoded-cwd>/<session-id>/.
+ * Skips subagent session dirs (they fold under their parent via listGrokSubagents).
+ */
+export async function listGrokFiles(): Promise<string[]> {
+  const root = getGrokSessionsDir();
+  const sessions: string[] = [];
+  let groups: fs.Dirent[];
+  try {
+    groups = await fs.promises.readdir(root, { withFileTypes: true });
+  } catch {
+    return sessions;
+  }
+  for (const group of groups) {
+    if (!group.isDirectory()) continue;
+    // Skip the FTS index file living next to cwd groups.
+    if (group.name.endsWith(".sqlite") || group.name.startsWith(".")) continue;
+    const groupPath = path.join(root, group.name);
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(groupPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const sessionDir = path.join(groupPath, entry.name);
+      const summaryPath = path.join(sessionDir, "summary.json");
+      const updatesPath = path.join(sessionDir, "updates.jsonl");
+      if (!fs.existsSync(summaryPath) || !fs.existsSync(updatesPath)) continue;
+      try {
+        const summary = JSON.parse(await fs.promises.readFile(summaryPath, "utf-8")) as {
+          session_kind?: unknown;
+        };
+        const kind = typeof summary.session_kind === "string" ? summary.session_kind : "";
+        // Subagents (and resumed subagents) are folded under the parent, not ingested alone.
+        if (kind === "subagent" || kind === "subagent_resume" || kind.startsWith("subagent")) continue;
+      } catch {
+        // Unreadable summary — still list if updates exist; parser will handle empty.
+      }
+      sessions.push(sessionDir);
+    }
+  }
+  return sessions;
+}
+
+/**
+ * Files that make up one Grok session unit for incremental backfill: summary, updates,
+ * and each subagent's summary/updates.
+ */
+export async function listGrokUnitFiles(sessionDir: string): Promise<string[]> {
+  const files = [
+    path.join(sessionDir, "summary.json"),
+    path.join(sessionDir, "updates.jsonl"),
+  ];
+  const subs = await listGrokSubagents(sessionDir);
+  for (const s of subs) {
+    files.push(path.join(s.path, "summary.json"), path.join(s.path, "updates.jsonl"));
+  }
+  return files.filter((f) => fs.existsSync(f));
+}
+
+/**
+ * Discover a Grok session's subagents. Each child is a full session directory next to the
+ * parent (same cwd group); linkage lives in parent `subagents/<id>/meta.json`.
+ */
+export async function listGrokSubagents(parentSessionDir: string): Promise<SubagentRef[]> {
+  const subdir = path.join(parentSessionDir, "subagents");
+  const parentSessionId = path.basename(parentSessionDir);
+  const cwdGroup = path.dirname(parentSessionDir);
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(subdir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const refs: SubagentRef[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const metaPath = path.join(subdir, entry.name, "meta.json");
+    let agentId = entry.name;
+    let agentType = "agent";
+    let childSessionId = entry.name;
+    try {
+      const meta = JSON.parse(await fs.promises.readFile(metaPath, "utf-8")) as {
+        subagent_id?: unknown;
+        child_session_id?: unknown;
+        subagent_type?: unknown;
+      };
+      if (typeof meta.subagent_id === "string" && meta.subagent_id) agentId = meta.subagent_id;
+      if (typeof meta.child_session_id === "string" && meta.child_session_id) {
+        childSessionId = meta.child_session_id;
+      }
+      if (typeof meta.subagent_type === "string" && meta.subagent_type) agentType = meta.subagent_type;
+    } catch {
+      // meta optional — fall back to directory name
+    }
+    const childDir = path.join(cwdGroup, childSessionId);
+    if (!fs.existsSync(path.join(childDir, "updates.jsonl"))) continue;
+    refs.push({
+      path: childDir,
+      parentSessionId,
+      agentId,
+      agentType,
+    });
+  }
+  return refs;
+}
+
+/**
+ * Parse a Grok Build session directory. Conversation + tools come from `updates.jsonl`
+ * (the restore log); cwd/branch/title from `summary.json`.
+ */
+export async function parseGrokTranscript(
+  sessionDir: string,
+  attribution?: ParseAttribution,
+): Promise<ParsedTranscript> {
+  const sessionId = attribution?.sessionId ?? path.basename(sessionDir);
+  const agent = attribution?.agent ?? null;
+  const agentId = attribution?.agentId ?? null;
+
+  let title: string | null = null;
+  let cwd: string | null = null;
+  let branch: string | null = null;
+  try {
+    const summary = JSON.parse(
+      await fs.promises.readFile(path.join(sessionDir, "summary.json"), "utf-8"),
+    ) as {
+      generated_title?: unknown;
+      session_summary?: unknown;
+      head_branch?: unknown;
+      info?: { id?: unknown; cwd?: unknown };
+    };
+    if (typeof summary.generated_title === "string" && summary.generated_title) {
+      title = summary.generated_title;
+    } else if (typeof summary.session_summary === "string" && summary.session_summary) {
+      title = summary.session_summary;
+    }
+    if (typeof summary.head_branch === "string") branch = summary.head_branch;
+    if (typeof summary.info?.cwd === "string") cwd = summary.info.cwd;
+  } catch {
+    // missing/corrupt summary — parse updates alone
+  }
+
+  const toolEvents: ToolEvent[] = [];
+  const userTurns: UserTurn[] = [];
+  const messages: ConvMessage[] = [];
+
+  // Assemble consecutive message chunks of the same role into one turn.
+  let curRole: Role | null = null;
+  let curParts: string[] = [];
+  let curTs = "";
+
+  const flush = (role: Role | null, parts: string[], ts: string) => {
+    if (!role || parts.length === 0) return;
+    const text = parts.join("").trim();
+    if (!text) return;
+    if (role === "user") {
+      if (isNoiseUserText(text)) return;
+      userTurns.push({ text, branch, timestamp: ts });
+      messages.push({ role: "user", agent, agentId, branch, timestamp: ts, text });
+    } else {
+      messages.push({ role: "assistant", agent, agentId, branch, timestamp: ts, text });
+    }
+  };
+
+  const endTurn = () => {
+    flush(curRole, curParts, curTs);
+    curRole = null;
+    curParts = [];
+    curTs = "";
+  };
+
+  const updatesPath = path.join(sessionDir, "updates.jsonl");
+  if (!fs.existsSync(updatesPath)) {
+    return { sessionId, title, toolEvents, userTurns, messages, framing: null };
+  }
+
+  const rl = readline.createInterface({
+    input: fs.createReadStream(updatesPath),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let obj: {
+      timestamp?: unknown;
+      params?: {
+        update?: {
+          sessionUpdate?: unknown;
+          content?: { type?: unknown; text?: unknown };
+          rawInput?: Record<string, unknown>;
+          title?: unknown;
+          status?: unknown;
+          _meta?: {
+            agentTimestampMs?: unknown;
+            "x.ai/tool"?: { name?: unknown };
+          };
+        };
+      };
+    };
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const update = obj.params?.update;
+    if (!update || typeof update.sessionUpdate !== "string") continue;
+    const kind = update.sessionUpdate;
+    const ts = grokTs(obj.timestamp, update._meta?.agentTimestampMs);
+
+    if (kind === "user_message_chunk" || kind === "agent_message_chunk") {
+      const role: Role = kind === "user_message_chunk" ? "user" : "assistant";
+      const chunk =
+        update.content && typeof update.content === "object" && typeof update.content.text === "string"
+          ? update.content.text
+          : "";
+      if (!chunk) continue;
+      if (curRole && curRole !== role) endTurn();
+      if (!curRole) {
+        curRole = role;
+        curTs = ts;
+      }
+      curParts.push(chunk);
+      continue;
+    }
+
+    // Any non-message update ends the current assembled turn.
+    endTurn();
+
+    if (kind === "tool_call") {
+      const toolName =
+        (typeof update._meta?.["x.ai/tool"]?.name === "string" && update._meta["x.ai/tool"].name) ||
+        (typeof update.title === "string" ? update.title : "");
+      const input = (update.rawInput && typeof update.rawInput === "object" ? update.rawInput : {}) as Record<
+        string,
+        unknown
+      >;
+      if (GROK_FILE_TOOLS.has(toolName)) {
+        const file =
+          typeof input.file_path === "string"
+            ? input.file_path
+            : typeof input.path === "string"
+              ? input.path
+              : null;
+        if (file) {
+          toolEvents.push({
+            tool: toolName === "write" ? "Write" : "Edit",
+            file,
+            command: null,
+            branch,
+            cwd,
+            timestamp: ts,
+          });
+        }
+      } else if (GROK_COMMAND_TOOLS.has(toolName) && typeof input.command === "string") {
+        toolEvents.push({
+          tool: "Bash",
+          file: null,
+          command: input.command,
+          branch,
+          cwd,
+          timestamp: ts,
+        });
+      }
+    }
+  }
+  endTurn();
+
+  return {
+    sessionId,
+    title,
+    toolEvents,
+    userTurns,
+    messages,
+    framing: userTurns[0]?.text ?? null,
+  };
 }

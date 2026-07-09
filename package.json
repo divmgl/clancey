@@ -1,7 +1,7 @@
 {
   "name": "clancey",
   "version": "1.9.1",
-  "description": "A memory for your AI coding sessions: map a branch or file to the Claude Code conversations that produced it, recall recorded decisions, and read the verbatim turns",
+  "description": "A memory for your AI coding sessions: map a branch or file to the conversations that produced it across Claude Code, Grok Build, OpenCode, and Codex",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -27,6 +27,9 @@
     "mcp",
     "claude",
     "claude-code",
+    "grok",
+    "codex",
+    "opencode",
     "conversation",
     "memory",
     "decisions"
