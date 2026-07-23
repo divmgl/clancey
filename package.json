@@ -1,6 +1,6 @@
 {
   "name": "clancey",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Shared conversation index across Claude Code, Grok Build, OpenCode, Codex, and Hermes — look up which session produced a branch, file, or PR from any of those clients",
   "type": "module",
   "main": "dist/index.js",
