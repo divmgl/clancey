@@ -2,8 +2,10 @@ import fs from "fs";
 import path from "path";
 import { listCodexFiles, parseCodexJsonlLine, type CodexParseState, type ToolEvent } from "./parser.js";
 import { repoKey } from "./git.js";
-import { CLANCEY_DIR, insertToolEvent, type Store } from "./store.js";
+import { insertToolEvent, type Store } from "./store.js";
 import { log, logError } from "./logger.js";
+import { resolveClanceyDir } from "./paths.js";
+import { isPidAlive } from "./pid.js";
 
 interface FileState {
   offset: number;
@@ -78,16 +80,6 @@ function emptyCodex(): CodexParseState {
   return { cwd: null, branch: null };
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export interface LiveCaptureLock {
   owned: boolean;
   release: () => void;
@@ -140,7 +132,7 @@ export function tryClaimCodexLiveLock(lockPath: string): LiveCaptureLock {
 }
 
 export function defaultCodexLiveLockPath(): string {
-  return path.join(CLANCEY_DIR, DEFAULT_LOCK_NAME);
+  return path.join(resolveClanceyDir(), DEFAULT_LOCK_NAME);
 }
 
 /**

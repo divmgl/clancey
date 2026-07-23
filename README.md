@@ -50,9 +50,9 @@ You never call Clancey directly. Your agent does, whenever you ask about past wo
 - *"What did Codex do on `feat` last week?"* (or Claude, Grok, OpenCode, Hermes)
 - *"Search everything we said about edge auth a week ago."* / *"…yesterday."* / *"…in the last 7 days."*
 
-Clancey can scope by **repo**, **branch**, **which coding tool**, and **plain-English time** (“last week”, “a week ago”, “yesterday”). It can list recent sessions, open the full transcript (including subagent turns), and fall back to a snapshot if the original chat file was pruned.
+Clancey can scope by **repo** (checkout path or `owner/name`), **branch**, **which coding tool**, and **plain-English time** (“last week”, “a week ago”, “yesterday”). It can list recent sessions, open the full transcript (including subagent turns), and fall back to a snapshot if the original chat file was pruned.
 
-If something you just finished doesn’t show up yet, ask the agent to refresh the index (or run `npx clancey backfill` yourself).
+While any coding client has Clancey MCP open, a single background **`clancey watch`** keeps the index fresh by re-ingesting changed transcripts. You do not need to run backfill by hand for ordinary work. If something still looks missing, ask the agent to refresh the index (or run `npx clancey backfill`).
 
 **Optional enrichment:** as you work, the agent may record decisions and learnings (commits, PRs, root causes, approach choices) so later search is sharper. You can also ask it to mine older sessions for decisions after the fact. Lookup works without that — imported history is enough.
 
@@ -74,6 +74,7 @@ You only ever run `setup` by hand; your agent runs everything else for you. Setu
 ```
 npx clancey setup       Set up Clancey and import history (run once)
 npx clancey backfill    Re-import / refresh the conversation index
+npx clancey watch       Background indexer (auto-started by MCP; one instance)
 ```
 
 Your agent can also refresh the index from inside a session when results look stale. Run `npx clancey --help` for the full list. Everything Clancey stores lives in `~/.clancey/`.

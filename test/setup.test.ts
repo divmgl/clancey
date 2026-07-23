@@ -430,6 +430,9 @@ describe("configureSkill", () => {
     assert.match(md, /Mine a session for decisions/i);
     assert.match(md, /list_sessions/);
     assert.match(md, /host: "codex"/);
+    assert.match(md, /owner\/name/);
+    assert.match(md, /exclude_session/);
+    assert.match(md, /Prior sessions/i);
     // Prefer quality over the old "copiously" volume nudge.
     assert.doesNotMatch(md, /copious/i);
     // Recording is enrichment, still documented.

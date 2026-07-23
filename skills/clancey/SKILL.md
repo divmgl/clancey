@@ -34,7 +34,9 @@ When the user asks about past work, **retrieve the conversation**. Do not invent
 | Full session text | `read_turns` | Entire conversation for a session id. Optional **branch slice**. If the live transcript was pruned, Clancey serves the **stored snapshot**. |
 | Stale / empty index | `refresh_index` | Re-ingest changed transcripts so recent work is findable. |
 
-Shared scope knobs (where supported): `repo`, `branch`, `host` (`claude` \| `codex` \| `opencode` \| `grok`), `time` / `since` / `until`, `limit`.
+Shared scope knobs (where supported): `repo`, `branch`, `host` (`claude` \| `codex` \| `opencode` \| `grok` \| `hermes`), `time` / `since` / `until`, `limit`, `exclude_session` / `exclude_sessions`.
+
+**Repo keys.** `repo` accepts an absolute checkout path **or** a short `owner/name` from the git remote — both match the same work when that remote is known. Prefer whichever form you have; do not conclude the index is empty just because one form returned nothing without trying the other (or dropping `repo`).
 
 ### Time windows (plain English)
 
@@ -57,7 +59,8 @@ Explicit `since` / `until` (ISO) override `time`.
 - Ground the answer in retrieved turns. Prefer `read_turns` over summarizing a single hit line.
 - Cite the session id (and host when shown). Subagent lines look like `[assistant·Plan]`.
 - If the live file is gone, trust snapshot text from `read_turns` (`transcript pruned; served from snapshot`).
-- If nothing matches, say so. Call `refresh_index` when work should exist but the index looks empty/stale, then retry. Never fabricate a conversation.
+- **Prior sessions, not this one.** If the top hit is the current conversation (it restates the user’s question or matches your session id), that is not “index empty.” Call `list_sessions` for the repo/branch, then `read_turns` on **earlier** sessions — or pass `exclude_session: "<current id>"` on `search` / `grep_turns` / `list_sessions`. Only after that fails should you treat results as missing.
+- If nothing matches after that, say so. Call `refresh_index` when work should exist but still looks empty, then retry. Never fabricate a conversation. Never invent freshness metrics Clancey did not return.
 
 ### Examples
 
@@ -72,8 +75,17 @@ read_turns({ session: "<id from recall>" })
 
 ```
 recall({ repo: "owner/name" })
+// path form also works: repo: "/absolute/checkout"
 list_sessions({ repo: "owner/name", limit: 10 })
 read_turns({ session: "<id>" })
+```
+
+**"Where did we leave off on X?" (avoid ranking the current chat first)**
+
+```
+list_sessions({ repo: "owner/name", limit: 10 })
+// or: grep_turns({ query: "X", repo: "owner/name", exclude_session: "<current session id>" })
+read_turns({ session: "<prior id, not current>" })
 ```
 
 **"Only what Codex did on `feat` last week"**
@@ -160,5 +172,6 @@ record_learning({
 ## Rules
 
 - Lookup before speculation.
+- **MCP only.** Use Clancey tools for conversation history. If they are not available yet (server still connecting / `partial`), wait and retry — do not open Clancey’s on-disk database, host session directories, or other SQLite/transcript stores as a workaround.
 - Empty results are valid; do not invent past conversations or decisions.
 - Do not announce recording.

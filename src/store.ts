@@ -1,11 +1,14 @@
 import Database from "better-sqlite3";
 import path from "path";
-import os from "os";
 import fs from "fs";
 import { vectorToBlob, blobToVector, cosineSimilarity } from "./embeddings.js";
+import { expandRepoFilterKeys } from "./git.js";
+import { resolveClanceyDir, resolveDbPath } from "./paths.js";
 
-export const CLANCEY_DIR = path.join(os.homedir(), ".clancey");
-export const DB_PATH = path.join(CLANCEY_DIR, "clancey.db");
+/** @deprecated Prefer resolveClanceyDir() — value is resolved at module load. */
+export const CLANCEY_DIR = resolveClanceyDir();
+/** @deprecated Prefer resolveDbPath() — value is resolved at module load. */
+export const DB_PATH = resolveDbPath();
 
 export type Store = Database.Database;
 
@@ -124,8 +127,12 @@ export interface TimeFilter {
 export interface SearchOptions extends TimeFilter {
   limit?: number;
   repo?: string;
+  /** Prefer this over raw `repo` when the caller already expanded path ↔ owner/name keys. */
+  repos?: string[];
   branch?: string;
   host?: string;
+  /** Session ids to omit (e.g. the current conversation). */
+  excludeSessions?: string[];
 }
 
 export interface SessionSummary {
@@ -137,7 +144,7 @@ export interface SessionSummary {
   lastTs: string;
 }
 
-export function openStore(dbPath: string = DB_PATH): Store {
+export function openStore(dbPath: string = resolveDbPath()): Store {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
@@ -488,24 +495,142 @@ function eqOrNull(col: string, value: string | null, param: string): string {
   return value === null ? `${col} IS NULL` : `${col} = @${param}`;
 }
 
+/**
+ * Distinct non-null repo keys stored in the index (for reverse short-key → path expansion).
+ */
+export function listKnownRepos(db: Store): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT repo FROM (
+         SELECT repo FROM events WHERE repo IS NOT NULL AND repo <> ''
+         UNION
+         SELECT repo FROM messages WHERE repo IS NOT NULL AND repo <> ''
+         UNION
+         SELECT repo FROM embeddings WHERE repo IS NOT NULL AND repo <> ''
+       )`,
+    )
+    .all() as { repo: string }[];
+  return rows.map((r) => r.repo);
+}
+
+/** Bind `repo IN (...)` or `repo = @repo` from a single key or expanded list. */
+function bindRepoFilter(
+  col: string,
+  opts: { repo?: string; repos?: string[] },
+  params: Record<string, string | number>,
+  prefix = "repo",
+): string {
+  const keys =
+    opts.repos && opts.repos.length > 0
+      ? [...new Set(opts.repos.filter(Boolean))]
+      : opts.repo
+        ? [opts.repo]
+        : [];
+  if (keys.length === 0) return "";
+  if (keys.length === 1) {
+    params[prefix] = keys[0];
+    return `${col} = @${prefix}`;
+  }
+  const placeholders: string[] = [];
+  keys.forEach((k, i) => {
+    const p = `${prefix}${i}`;
+    params[p] = k;
+    placeholders.push(`@${p}`);
+  });
+  return `${col} IN (${placeholders.join(", ")})`;
+}
+
+function bindExcludeSessions(
+  col: string,
+  exclude: string[] | undefined,
+  params: Record<string, string | number>,
+  prefix = "exSes",
+): string {
+  const ids = [...new Set((exclude ?? []).filter(Boolean))];
+  if (ids.length === 0) return "";
+  const placeholders: string[] = [];
+  ids.forEach((id, i) => {
+    const p = `${prefix}${i}`;
+    params[p] = id;
+    placeholders.push(`@${p}`);
+  });
+  return `${col} NOT IN (${placeholders.join(", ")})`;
+}
+
+/**
+ * Normalize MCP/CLI exclude args into a session-id list.
+ * Accepts `exclude_session`, `exclude_sessions` (string or array), or `excludeSessions`.
+ */
+export function collectExcludeSessions(args: {
+  exclude_session?: unknown;
+  exclude_sessions?: unknown;
+  excludeSessions?: unknown;
+}): string[] | undefined {
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) out.push(v.trim());
+    else if (Array.isArray(v)) {
+      for (const item of v) {
+        if (typeof item === "string" && item.trim()) out.push(item.trim());
+      }
+    }
+  };
+  push(args.exclude_session);
+  push(args.exclude_sessions);
+  push(args.excludeSessions);
+  const ids = [...new Set(out)];
+  return ids.length ? ids : undefined;
+}
+
+/**
+ * Resolve shipped lookup scope: expand `repo` path ↔ owner/name against known store keys,
+ * and normalize session exclusion. Used by MCP handlers so tests can drive the same path.
+ */
+export function resolveLookupScope(
+  db: Store,
+  args: {
+    repo?: string;
+    branch?: string;
+    host?: string;
+    since?: string;
+    until?: string;
+    limit?: number;
+    exclude_session?: unknown;
+    exclude_sessions?: unknown;
+    excludeSessions?: unknown;
+  },
+): SearchOptions {
+  const repo = typeof args.repo === "string" && args.repo.trim() ? args.repo.trim() : undefined;
+  const repos = repo ? expandRepoFilterKeys(repo, listKnownRepos(db)) : undefined;
+  return {
+    ...(repos && repos.length ? { repos } : {}),
+    ...(args.branch ? { branch: args.branch } : {}),
+    ...(args.host ? { host: args.host } : {}),
+    ...(args.since ? { since: args.since } : {}),
+    ...(args.until ? { until: args.until } : {}),
+    ...(args.limit != null ? { limit: args.limit } : {}),
+    excludeSessions: collectExcludeSessions(args),
+  };
+}
+
 export function recall(
   db: Store,
   opts: {
     repo?: string;
+    repos?: string[];
     branch?: string;
     file?: string;
     host?: string;
     since?: string;
     until?: string;
     limit?: number;
+    excludeSessions?: string[];
   } = {},
 ): WorkItem[] {
   const where: string[] = [];
-  const params: Record<string, string> = {};
-  if (opts.repo) {
-    where.push("repo = @repo");
-    params.repo = opts.repo;
-  }
+  const params: Record<string, string | number> = {};
+  const repoClause = bindRepoFilter("repo", opts, params);
+  if (repoClause) where.push(repoClause);
   if (opts.branch) {
     where.push("branch = @branch");
     params.branch = opts.branch;
@@ -527,6 +652,8 @@ export function recall(
     where.push("ts < @until");
     params.until = opts.until;
   }
+  const ex = bindExcludeSessions("session", opts.excludeSessions, params);
+  if (ex) where.push(ex);
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
   // Candidate (repo, branch) groups matching the filters, most recent first.
@@ -631,10 +758,8 @@ function scopeWhere(
     where.push(`${col("ts")} < @until`);
     params.until = opts.until;
   }
-  if (opts.repo) {
-    where.push(`${col("repo")} = @repo`);
-    params.repo = opts.repo;
-  }
+  const repoClause = bindRepoFilter(col("repo"), opts, params);
+  if (repoClause) where.push(repoClause);
   if (opts.branch) {
     where.push(`${col("branch")} = @branch`);
     params.branch = opts.branch;
@@ -644,6 +769,8 @@ function scopeWhere(
     where.push(`${col("host")} = @host`);
     params.host = host;
   }
+  const ex = bindExcludeSessions(col("session"), opts.excludeSessions, params);
+  if (ex) where.push(ex);
   return where.length ? ` AND ${where.join(" AND ")}` : "";
 }
 
@@ -702,10 +829,8 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
     where.push("ts < @until");
     params.until = options.until;
   }
-  if (options.repo) {
-    where.push("repo = @repo");
-    params.repo = options.repo;
-  }
+  const repoClause = bindRepoFilter("repo", options, params);
+  if (repoClause) where.push(repoClause);
   if (options.branch) {
     where.push("branch = @branch");
     params.branch = options.branch;
@@ -715,6 +840,8 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
     where.push("host = @host");
     params.host = host;
   }
+  const ex = bindExcludeSessions("session", options.excludeSessions, params);
+  if (ex) where.push(ex);
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const rows = db
     .prepare(`SELECT session, repo, branch, kind, text, vector, host FROM embeddings ${clause}`)
@@ -759,10 +886,8 @@ export function listRecentSessions(
     filters.push("ts < @until");
     params.until = opts.until;
   }
-  if (opts.repo) {
-    filters.push("repo = @repo");
-    params.repo = opts.repo;
-  }
+  const repoClause = bindRepoFilter("repo", opts, params);
+  if (repoClause) filters.push(repoClause);
   if (opts.branch) {
     filters.push("branch = @branch");
     params.branch = opts.branch;
@@ -772,6 +897,8 @@ export function listRecentSessions(
     filters.push("host = @host");
     params.host = host;
   }
+  const ex = bindExcludeSessions("session", opts.excludeSessions, params);
+  if (ex) filters.push(ex);
   const where = `WHERE ${filters.join(" AND ")}`;
   const rows = db
     .prepare(

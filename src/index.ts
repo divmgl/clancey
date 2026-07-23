@@ -22,6 +22,7 @@ import {
   setMeta,
   storeTotals,
   normalizeHost,
+  resolveLookupScope,
   WorkItem,
   SearchHit,
   TurnHit,
@@ -35,6 +36,9 @@ import { setup, backfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import { resolveTimeFilter } from "./time.js";
 import { startCodexLiveCapture } from "./codex-live.js";
+import { registerMcpClient, heartbeatMcpClient, unregisterMcpClient } from "./mcp-clients.js";
+import { ensureWatchRunning, runWatchCli } from "./watch.js";
+import { resolveClanceyDir, resolveDbPath } from "./paths.js";
 
 const EMPTY_LOOKUP_HINT =
   "No matches. If this work just happened or a recent session is missing, call refresh_index (or run `clancey backfill`) and try again.";
@@ -123,11 +127,15 @@ function formatSessions(rows: SessionSummary[]): string {
 }
 
 const SCOPE_PROPS = {
-  repo: { type: "string", description: "Limit to this repo key (owner/name or path)" },
+  repo: {
+    type: "string",
+    description:
+      "Limit to this repo — absolute checkout path or short owner/name (both match when the remote is known)",
+  },
   branch: { type: "string", description: "Exact branch name" },
   host: {
     type: "string",
-    description: "Coding host: claude | codex | opencode | grok",
+    description: "Coding host: claude | codex | opencode | grok | hermes",
   },
   since: { type: "string", description: "ISO timestamp lower bound" },
   until: { type: "string", description: "ISO timestamp exclusive upper bound" },
@@ -137,6 +145,15 @@ const SCOPE_PROPS = {
       "Natural-language time window, e.g. 'last week', 'a week ago', 'yesterday', or 'Sep 12-13'. Explicit since/until override this.",
   },
   limit: { type: "number", description: "Max results" },
+  exclude_session: {
+    type: "string",
+    description: "Omit this session id from results (e.g. the current conversation)",
+  },
+  exclude_sessions: {
+    type: "array",
+    items: { type: "string" },
+    description: "Omit these session ids from results",
+  },
 } as const;
 
 function buildServer(db: Store): Server {
@@ -441,13 +458,18 @@ function buildServer(db: Store): Server {
             until: args.until as string | undefined,
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
-          const items = recall(db, {
+          const scope = resolveLookupScope(db, {
             repo: args.repo as string | undefined,
             branch: args.branch as string | undefined,
-            file: args.file as string | undefined,
             host: args.host as string | undefined,
-            ...time.filter,
             limit: args.limit as number | undefined,
+            exclude_session: args.exclude_session,
+            exclude_sessions: args.exclude_sessions,
+            ...time.filter,
+          });
+          const items = recall(db, {
+            ...scope,
+            file: args.file as string | undefined,
           });
           return text(formatWorkItems(items));
         }
@@ -461,13 +483,16 @@ function buildServer(db: Store): Server {
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
           const vector = await embedOne(query);
-          const hits = search(db, vector, {
-            limit: (args.limit as number) ?? 8,
+          const scope = resolveLookupScope(db, {
             repo: args.repo as string | undefined,
             branch: args.branch as string | undefined,
             host: args.host as string | undefined,
+            limit: (args.limit as number) ?? 8,
+            exclude_session: args.exclude_session,
+            exclude_sessions: args.exclude_sessions,
             ...time.filter,
           });
+          const hits = search(db, vector, scope);
           let out = formatSearchHits(hits);
           const top = hits[0]?.score ?? 0;
           if (hits.length > 0 && top < LOW_CONFIDENCE) {
@@ -484,17 +509,16 @@ function buildServer(db: Store): Server {
             until: args.until as string | undefined,
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
-          return text(
-            formatTurnHits(
-              grepTurns(db, query, {
-                limit: (args.limit as number) ?? 8,
-                repo: args.repo as string | undefined,
-                branch: args.branch as string | undefined,
-                host: args.host as string | undefined,
-                ...time.filter,
-              }),
-            ),
-          );
+          const scope = resolveLookupScope(db, {
+            repo: args.repo as string | undefined,
+            branch: args.branch as string | undefined,
+            host: args.host as string | undefined,
+            limit: (args.limit as number) ?? 8,
+            exclude_session: args.exclude_session,
+            exclude_sessions: args.exclude_sessions,
+            ...time.filter,
+          });
+          return text(formatTurnHits(grepTurns(db, query, scope)));
         }
         case "list_sessions": {
           const time = resolveTimeFilter({
@@ -503,17 +527,16 @@ function buildServer(db: Store): Server {
             until: args.until as string | undefined,
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
-          return text(
-            formatSessions(
-              listRecentSessions(db, {
-                limit: (args.limit as number) ?? 20,
-                repo: args.repo as string | undefined,
-                branch: args.branch as string | undefined,
-                host: args.host as string | undefined,
-                ...time.filter,
-              }),
-            ),
-          );
+          const scope = resolveLookupScope(db, {
+            repo: args.repo as string | undefined,
+            branch: args.branch as string | undefined,
+            host: args.host as string | undefined,
+            limit: (args.limit as number) ?? 20,
+            exclude_session: args.exclude_session,
+            exclude_sessions: args.exclude_sessions,
+            ...time.filter,
+          });
+          return text(formatSessions(listRecentSessions(db, scope)));
         }
         case "refresh_index": {
           const force = Boolean(args.force);
@@ -585,8 +608,45 @@ function buildServer(db: Store): Server {
   return server;
 }
 
+const MCP_HEARTBEAT_MS = 5_000;
+
 async function runServer(): Promise<void> {
-  const db = openStore();
+  const dir = resolveClanceyDir();
+  // Register before spawning watch so the watcher sees at least one live client.
+  const clientId = registerMcpClient({ dir });
+  const beat = setInterval(() => {
+    try {
+      heartbeatMcpClient(clientId, { dir });
+    } catch {
+      // ignore
+    }
+  }, MCP_HEARTBEAT_MS);
+  beat.unref?.();
+
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    clearInterval(beat);
+    try {
+      unregisterMcpClient(clientId, { dir });
+    } catch {
+      // ignore
+    }
+  };
+  process.once("exit", cleanup);
+  process.once("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.once("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+
+  ensureWatchRunning({ dir });
+
+  const db = openStore(resolveDbPath(dir));
   startCodexLiveCapture(db);
   const server = buildServer(db);
   const transport = new StdioServerTransport();
@@ -600,10 +660,12 @@ Usage:
   clancey                 Start the MCP server over stdio
   clancey setup           Wire MCP + skill (+ live capture) globally, clean legacy index, backfill
   clancey backfill        Ingest existing transcripts into the store
+  clancey watch           Incremental indexer (auto-started by MCP; single instance)
   clancey prune           Drop conversation history older than the retention window
   clancey hook            Internal: silent live capture (reads stdin)
 
 Look up conversations from Claude Code, Codex, OpenCode, Grok Build, and Hermes in one store.
+MCP start registers this client and ensures one detached \`clancey watch\` keeps the index fresh.
 
 Run "clancey <command> --help" for command-specific options.`;
 
@@ -710,6 +772,9 @@ async function main(): Promise<void> {
   switch (command) {
     case "hook":
       await runHook();
+      return;
+    case "watch":
+      await runWatchCli(rest);
       return;
     case "setup": {
       if (wantsHelp(rest)) {

@@ -59,10 +59,16 @@ export interface ParseAttribution {
 }
 
 export function getProjectsDir(): string {
+  // CLAUDE_HOME / CLAUDE_PROJECTS_DIR let tests (and unusual installs) isolate the scan root.
+  if (process.env.CLAUDE_PROJECTS_DIR?.trim()) return path.resolve(process.env.CLAUDE_PROJECTS_DIR.trim());
+  const home = process.env.CLAUDE_HOME?.trim();
+  if (home) return path.join(path.resolve(home), "projects");
   return path.join(os.homedir(), ".claude", "projects");
 }
 
 export function getCodexSessionsDir(): string {
+  const home = process.env.CODEX_HOME?.trim();
+  if (home) return path.join(path.resolve(home), "sessions");
   return path.join(os.homedir(), ".codex", "sessions");
 }
 
