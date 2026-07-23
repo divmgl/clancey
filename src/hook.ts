@@ -94,9 +94,9 @@ async function readStdin(): Promise<string> {
 }
 
 /**
- * `clancey hook` — invoked by host PostToolUse / SessionStart hooks.
- * Records file/command tool events. Decision/learning recording is driven by MCP tool
- * descriptions, not by injected coaching text.
+ * `clancey hook` — invoked by host live-capture hooks (PostToolUse / SessionStart).
+ * Silently records file/command tool events. Decision/learning coaching lives in the
+ * Clancey skill, not in injected hook text.
  * Must never throw or block: any failure exits 0 silently.
  */
 export async function runHook(): Promise<void> {
@@ -109,7 +109,7 @@ export async function runHook(): Promise<void> {
   }
 
   if (payload.hook_event_name === "SessionStart") {
-    // Optional upgrade notice only — no decision-coaching injection.
+    // Optional upgrade notice only — decision coaching is the Clancey skill.
     try {
       const db = openStore();
       try {

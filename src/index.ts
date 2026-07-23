@@ -112,7 +112,7 @@ function buildServer(db: Store): Server {
       {
         name: "record_decision",
         description:
-          "Record a significant decision and its rationale, anchored to the current repo and branch. Call this copiously as you work — after commits, PRs, root-causing bugs, choosing between approaches, or when the user corrects you. Capture the why and the alternatives rejected, not just what changed.",
+          "Record a significant decision and its rationale, anchored to the current repo and branch. Capture the why and the alternatives rejected, not just what changed. (When to call this is defined by the Clancey skill.)",
         inputSchema: {
           type: "object",
           properties: {
@@ -154,7 +154,7 @@ function buildServer(db: Store): Server {
       {
         name: "record_learning",
         description:
-          "Record an incidental learning — a non-obvious fact you discovered about the system (a gotcha, a constraint, how a subsystem actually behaves) — anchored to the current repo and branch. Record these copiously as you work, separate from decisions: not what you chose, but what you found out.",
+          "Record an incidental learning — a non-obvious fact about the system (a gotcha, a constraint, how a subsystem actually behaves) — anchored to the current repo and branch. Separate from decisions: not what you chose, but what you found out. (When to call this is defined by the Clancey skill.)",
         inputSchema: {
           type: "object",
           properties: {
@@ -438,10 +438,10 @@ const HELP = `clancey — a memory for your AI coding sessions
 
 Usage:
   clancey                 Start the MCP server over stdio
-  clancey setup           Wire hooks + MCP globally, clean legacy index, backfill
+  clancey setup           Wire MCP + skill (+ live capture) globally, clean legacy index, backfill
   clancey backfill        Ingest existing transcripts into the store
   clancey prune           Drop conversation history older than the retention window
-  clancey hook            Internal: invoked by host hooks (reads stdin)
+  clancey hook            Internal: silent live capture (reads stdin)
 
 Supports Claude Code, Codex, OpenCode, and Grok Build.
 
@@ -461,10 +461,16 @@ Options:
 
 const SETUP_HELP = `clancey setup — wire clancey into your AI coding tools (global, idempotent)
 
-Claude Code: PostToolUse + SessionStart hooks in ~/.claude/settings.json and MCP at user scope.
-OpenCode: MCP server + live-recording plugin under ~/.config/opencode/.
-Codex: MCP server in ~/.codex/config.toml (history import + live tool poller).
-Grok Build: MCP server in ~/.grok/config.toml + live-recording hooks under ~/.grok/hooks/.
+Every host gets the Clancey MCP server and the Clancey skill (Agent Skills SKILL.md) that
+tells the agent when to record decisions/learnings and how to recall past work.
+
+Claude Code: MCP at user scope + skill in ~/.claude/skills/clancey/ + silent live-capture hooks.
+OpenCode: MCP + skill under ~/.config/opencode/ + live-recording plugin.
+Codex: MCP in ~/.codex/config.toml + skill in ~/.codex/skills/clancey/ (history import + live poller).
+Grok Build: MCP in ~/.grok/config.toml + skill in ~/.grok/skills/clancey/ + silent live-capture hooks.
+
+All hosts are pinned to this install's absolute entrypoint (node + path to dist/index.js),
+not npx package specs. Re-run setup after upgrading clancey to re-pin every host.
 
 Then offers to remove the legacy v1 index and backfills existing conversations from every
 detected host.

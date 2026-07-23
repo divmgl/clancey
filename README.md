@@ -9,14 +9,14 @@ Later you just ask your agent things like *"which conversation produced this PR,
 
 ## Supported tools
 
-| Tool | MCP | History import | Live tool events |
-|------|-----|----------------|------------------|
-| **Claude Code** | yes | yes | hooks |
-| **Grok Build** | yes | yes | hooks |
-| **OpenCode** | yes | yes | plugin |
-| **Codex** | yes | yes | poller while MCP runs |
+| Tool | MCP | Skill | History import | Live tool events |
+|------|-----|-------|----------------|------------------|
+| **Claude Code** | yes | yes | yes | silent live capture |
+| **Grok Build** | yes | yes | yes | silent live capture |
+| **OpenCode** | yes | yes | yes | plugin |
+| **Codex** | yes | yes | yes | poller while MCP runs |
 
-Decision and learning recording is driven by Clancey's MCP tool descriptions — call `record_decision` / `record_learning` as you work. Live hooks capture file edits and shell commands for search and branch mapping.
+Decision and learning recording is driven by the **Clancey skill** (Agent Skills `SKILL.md`) that setup installs into each tool — the agent loads it and calls `record_decision` / `record_learning` as it works. Live capture of file edits and shell commands is silent infrastructure for search and branch mapping; it does not coach the agent.
 
 ## Prerequisites
 
@@ -56,7 +56,7 @@ Recall is semantic, so it finds things by meaning even when you don't remember t
 
 ## Commands
 
-You only ever run `setup` by hand; your agent runs everything else for you. Setup pins the hooks and MCP server to the version that installed them, so a later release won't change your setup until you re-run it.
+You only ever run `setup` by hand; your agent runs everything else for you. Setup pins the MCP server, skill, and live capture to this install, so a later release won't change your setup until you re-run it.
 
 ```
 npx clancey setup       Set up Clancey and import history (run once)

@@ -39,7 +39,7 @@ describe("upgradeNotice", () => {
     assert.ok(notice);
     assert.match(notice!, /1\.2\.0/);
     assert.match(notice!, /1\.1\.1/);
-    assert.match(notice!, /npx -y clancey setup/);
+    assert.match(notice!, /clancey setup/);
   });
 
   test("returns null when already on the latest", async () => {

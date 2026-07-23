@@ -57,7 +57,7 @@ export async function upgradeNotice(
     }
 
     if (latest && isNewer(latest, current)) {
-      return `Clancey ${latest} is available (you're on ${current}). Run: npx -y clancey setup`;
+      return `Clancey ${latest} is available (you're on ${current}). Run: clancey setup (or npx clancey setup) to re-pin`;
     }
     return null;
   } catch {
