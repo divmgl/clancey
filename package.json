@@ -1,7 +1,7 @@
 {
   "name": "clancey",
-  "version": "2.0.0",
-  "description": "A memory for your AI coding sessions: map a branch or file to the conversations that produced it across Claude Code, Grok Build, OpenCode, and Codex",
+  "version": "2.1.0",
+  "description": "Shared conversation index across Claude Code, Grok Build, OpenCode, Codex, and Hermes — look up which session produced a branch, file, or PR from any of those clients",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -31,8 +31,11 @@
     "grok",
     "codex",
     "opencode",
+    "hermes",
     "conversation",
     "memory",
+    "transcript",
+    "cross-client",
     "decisions"
   ],
   "author": "Dexter Miguel",

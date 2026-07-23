@@ -27,10 +27,12 @@ import {
   listGrokSubagents,
   listOpencodeUnitFiles,
   listGrokUnitFiles,
+  listHermesUnitFiles,
   parseAny,
   parseSubagent,
   getOpencodeStorageDir,
   getGrokSessionsDir,
+  getHermesHome,
   ParsedTranscript,
   SubagentRef,
 } from "./parser.js";
@@ -41,7 +43,7 @@ import { setConsoleSilent } from "./logger.js";
 const tildify = (p: string) => p.replace(os.homedir(), "~");
 
 /** A tool clancey can wire itself into. */
-export type Target = "claude" | "codex" | "opencode" | "grok";
+export type Target = "claude" | "codex" | "opencode" | "grok" | "hermes";
 
 const POST_TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|search_replace|run_terminal_command";
 const FRAMING_MAX_CHARS = 2000;
@@ -94,7 +96,9 @@ export async function backfill(
         ? await listOpencodeUnitFiles(file)
         : ref.kind === "grok"
           ? await listGrokUnitFiles(file)
-          : [file, ...subRefs.map((s) => s.path)];
+          : ref.kind === "hermes"
+            ? listHermesUnitFiles(file)
+            : [file, ...subRefs.map((s) => s.path)];
     const mtimes = await Promise.all(
       unitFiles.map((f) =>
         fs.promises.stat(f).then(
@@ -131,6 +135,7 @@ export async function backfill(
     const apply = db.transaction(() => {
       deleteSession(db, parsed.sessionId);
 
+      const host = ref.kind;
       const insertEvents = (p: ParsedTranscript, agent: string | null) => {
         for (const e of p.toolEvents) {
           insertToolEvent(db, {
@@ -143,12 +148,14 @@ export async function backfill(
             command: e.command,
             ts: e.timestamp,
             agent,
+            host,
           });
           events++;
         }
       };
       const insertMessages = (p: ParsedTranscript) => {
         for (const m of p.messages) {
+          const repo = resolveRepo(first?.cwd ?? null);
           insertMessage(db, {
             session: parsed.sessionId,
             ts: m.timestamp,
@@ -157,6 +164,8 @@ export async function backfill(
             agent: m.agent,
             agentId: m.agentId,
             text: m.text,
+            host,
+            repo,
           });
         }
       };
@@ -177,6 +186,7 @@ export async function backfill(
           text: framingText(parsed.title, parsed.framing),
           vector: framingVec,
           ts: parsed.userTurns[0]?.timestamp ?? new Date().toISOString(),
+          host,
         });
         embeddings++;
       }
@@ -216,9 +226,9 @@ export function resolveLaunch(
   };
 }
 
-/** `node /abs/path/dist/index.js hook` — used by Claude and Grok command hooks. */
-export function renderHookCommand(launch: ClanceyLaunch): string {
-  return `${shellQuote(launch.node)} ${shellQuote(launch.entrypoint)} hook`;
+/** `node /abs/path/dist/index.js hook --host <host>` — used by Claude and Grok command hooks. */
+export function renderHookCommand(launch: ClanceyLaunch, host: "claude" | "grok" | "opencode" = "claude"): string {
+  return `${shellQuote(launch.node)} ${shellQuote(launch.entrypoint)} hook --host ${host}`;
 }
 
 /** Match any prior clancey hook form (npx pin, bare clancey, or node+entrypoint). */
@@ -226,7 +236,7 @@ const CLANCEY_HOOK_RE = /\bclancey(@\S+)?\s+hook\b|clancey[/\\]dist[/\\]index\.j
 
 /** Add (or re-pin) the clancey hooks in the global Claude Code settings, idempotently. */
 export function wireHooks(launch: ClanceyLaunch = resolveLaunch()): string {
-  const hookCmd = renderHookCommand(launch);
+  const hookCmd = renderHookCommand(launch, "claude");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
   let settings: { hooks?: Record<string, HookGroup[]> } = {};
   if (fs.existsSync(settingsPath)) {
@@ -334,7 +344,7 @@ function runHook(payload) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(NODE, [ENTRY, "hook"], { stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(NODE, [ENTRY, "hook", "--host", "opencode"], { stdio: ["pipe", "pipe", "ignore"] });
     } catch {
       resolve(null);
       return;
@@ -419,6 +429,14 @@ function hasGrok(): boolean {
   return fs.existsSync(grokHome()) || fs.existsSync(getGrokSessionsDir());
 }
 
+function hasHermes(): boolean {
+  return fs.existsSync(getHermesHome());
+}
+
+function hermesConfigPath(): string {
+  return path.join(getHermesHome(), "config.yaml");
+}
+
 const GROK_CONFIG = (): string => path.join(grokHome(), "config.toml");
 const GROK_HOOKS_DIR = (): string => path.join(grokHome(), "hooks");
 
@@ -460,7 +478,7 @@ export function configureGrokHooks(
 ): { result: "added" | "updated"; file: string } {
   const file = path.join(GROK_HOOKS_DIR(), "clancey.json");
   const had = fs.existsSync(file);
-  const hookCmd = renderHookCommand(launch);
+  const hookCmd = renderHookCommand(launch, "grok");
   const body = {
     hooks: {
       PostToolUse: [
@@ -514,12 +532,97 @@ export function skillDirFor(target: Target): string {
       return path.join(opencodeConfigDir(), "skills", SKILL_NAME);
     case "grok":
       return path.join(grokHome(), "skills", SKILL_NAME);
+    case "hermes":
+      return path.join(getHermesHome(), "skills", SKILL_NAME);
   }
 }
 
 /**
- * Install (or refresh) the Clancey skill for a host. Decision/learning guidance lives
- * here — the industry-standard Agent Skills path — not in PostToolUse coaching text.
+ * Upsert `mcp_servers.clancey` in a Hermes config.yaml without a YAML library.
+ * Replaces any existing clancey entry (including legacy `npx -y clancey@…` pins)
+ * and leaves sibling MCP servers and the rest of the file intact.
+ */
+export function upsertHermesClanceyMcp(
+  raw: string,
+  launch: ClanceyLaunch,
+): { text: string; had: boolean } {
+  const clanceyLines = [
+    "  clancey:",
+    `    command: ${JSON.stringify(launch.node)}`,
+    "    args:",
+    `      - ${JSON.stringify(launch.entrypoint)}`,
+  ];
+
+  const lines = raw.length ? raw.split("\n") : [];
+  // Drop a trailing empty line so joins stay tidy; restore a final newline at the end.
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  const isTopLevelKey = (line: string) => /^[^\s#]/.test(line) && line.trim() !== "";
+  const isMcpServers = (line: string) => /^mcp_servers:\s*(#.*)?$/.test(line);
+  const isClanceyKey = (line: string) => /^  clancey:\s*(#.*)?$/.test(line);
+  // Next server key under mcp_servers (two-space indent, not deeper).
+  const isMcpSiblingKey = (line: string) => /^  [^\s#]/.test(line) && !/^    /.test(line);
+
+  let mcpIdx = lines.findIndex(isMcpServers);
+  if (mcpIdx === -1) {
+    const out = [...lines];
+    if (out.length) out.push("");
+    out.push("mcp_servers:", ...clanceyLines);
+    return { text: out.join("\n") + "\n", had: false };
+  }
+
+  // Extent of the mcp_servers section: until the next top-level key.
+  let sectionEnd = lines.length;
+  for (let i = mcpIdx + 1; i < lines.length; i++) {
+    if (isTopLevelKey(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  let clanceyStart = -1;
+  let clanceyEnd = -1;
+  for (let i = mcpIdx + 1; i < sectionEnd; i++) {
+    if (!isClanceyKey(lines[i])) continue;
+    clanceyStart = i;
+    clanceyEnd = sectionEnd;
+    for (let j = i + 1; j < sectionEnd; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || l.trimStart().startsWith("#")) continue;
+      if (isMcpSiblingKey(l)) {
+        clanceyEnd = j;
+        break;
+      }
+    }
+    break;
+  }
+
+  const out = [...lines];
+  const had = clanceyStart !== -1;
+  if (had) {
+    out.splice(clanceyStart, clanceyEnd - clanceyStart, ...clanceyLines);
+  } else {
+    out.splice(mcpIdx + 1, 0, ...clanceyLines);
+  }
+  return { text: out.join("\n") + "\n", had };
+}
+
+/** Add (or re-pin) the clancey MCP server in Hermes config.yaml, idempotently. */
+export function configureHermes(
+  launch: ClanceyLaunch = resolveLaunch(),
+): { result: "added" | "updated"; file: string } {
+  const file = hermesConfigPath();
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : "";
+  const { text, had } = upsertHermesClanceyMcp(existing, launch);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+  return { result: had ? "updated" : "added", file };
+}
+
+/**
+ * Install (or refresh) the Clancey skill for a host. Teaches cross-client conversation
+ * lookup (and optional decision/learning enrichment) via the Agent Skills path —
+ * not PostToolUse coaching text.
  */
 export function configureSkill(target: Target): { result: "added" | "updated"; file: string } {
   const dir = skillDirFor(target);
@@ -708,8 +811,9 @@ async function selectTargets(preset: Target[] | null): Promise<Target[]> {
     codex: hasCodex(),
     opencode: hasOpencode(),
     grok: hasGrok(),
+    hermes: hasHermes(),
   };
-  const installed = (["claude", "codex", "opencode", "grok"] as const).filter((t) => detected[t]);
+  const installed = (["claude", "codex", "opencode", "grok", "hermes"] as const).filter((t) => detected[t]);
 
   if (preset) return preset;
   if (!process.stdin.isTTY) return [...installed];
@@ -722,6 +826,7 @@ async function selectTargets(preset: Target[] | null): Promise<Target[]> {
       { value: "codex", label: "Codex", hint: detected.codex ? "MCP + skill + history import" : "not detected" },
       { value: "opencode", label: "OpenCode", hint: detected.opencode ? "MCP + skill + live capture" : "not detected" },
       { value: "grok", label: "Grok Build", hint: detected.grok ? "MCP + skill + live capture" : "not detected" },
+      { value: "hermes", label: "Hermes Agent", hint: detected.hermes ? "MCP + skill + history import" : "not detected" },
     ],
     initialValues: [...installed],
     required: false,
@@ -821,6 +926,21 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: Target[] } 
     );
   }
 
+  if (targets.includes("hermes")) {
+    const hermes = configureHermes(launch);
+    clog.success(
+      hermes.result === "added"
+        ? `Registered Hermes MCP server (${pinLabel}) in ${tildify(hermes.file)}`
+        : `Re-pinned Hermes MCP server to ${pinLabel} in ${tildify(hermes.file)}`,
+    );
+    const skill = configureSkill("hermes");
+    clog.success(
+      skill.result === "added"
+        ? `Installed Clancey skill into ${tildify(skill.file)}`
+        : `Refreshed Clancey skill in ${tildify(skill.file)}`,
+    );
+  }
+
   const backfillSpin = spinner();
   backfillSpin.start("Backfilling conversations");
   const db = openStore();
@@ -845,6 +965,7 @@ export async function setup(opts: { cleanLegacy?: boolean; targets?: Target[] } 
     codex: "Codex",
     opencode: "OpenCode",
     grok: "Grok Build",
+    hermes: "Hermes Agent",
   };
   const restart = targets.map((t) => label[t]).join(" and ");
   outro(restart ? `Done — restart ${restart} to load the MCP server.` : "Done.");

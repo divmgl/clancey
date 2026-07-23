@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import readline from "readline";
+import Database from "better-sqlite3";
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
@@ -77,7 +78,34 @@ export function getGrokSessionsDir(): string {
   return path.join(grokHome, "sessions");
 }
 
-export type TranscriptKind = "claude" | "codex" | "opencode" | "grok";
+/** Hermes Agent home: $HERMES_HOME, else ~/.hermes. */
+export function getHermesHome(): string {
+  return process.env.HERMES_HOME || path.join(os.homedir(), ".hermes");
+}
+
+/** Hermes session store SQLite DB under the Hermes home. */
+export function getHermesStateDb(): string {
+  return path.join(getHermesHome(), "state.db");
+}
+
+/**
+ * Encode a Hermes session ref as `<state.db>#<sessionId>` so each session has a unique
+ * path key for ingest caching while still pointing at the shared DB file.
+ */
+export function hermesRefPath(dbPath: string, sessionId: string): string {
+  return `${dbPath}#${sessionId}`;
+}
+
+/** Split a Hermes transcript ref path into DB file + session id. */
+export function parseHermesRefPath(refPath: string): { dbPath: string; sessionId: string } {
+  const hash = refPath.lastIndexOf("#");
+  if (hash <= 0 || hash === refPath.length - 1) {
+    return { dbPath: refPath, sessionId: path.basename(refPath) };
+  }
+  return { dbPath: refPath.slice(0, hash), sessionId: refPath.slice(hash + 1) };
+}
+
+export type TranscriptKind = "claude" | "codex" | "opencode" | "grok" | "hermes";
 
 export interface TranscriptRef {
   path: string;
@@ -312,26 +340,29 @@ export async function listOpencodeFiles(): Promise<string[]> {
   return files;
 }
 
-/** Session id for a transcript ref — OpenCode files end in `.json`; Grok refs are session dirs. */
+/** Session id for a transcript ref — OpenCode files end in `.json`; Grok refs are session dirs; Hermes uses `db#id`. */
 export function sessionIdOf(ref: TranscriptRef): string {
   if (ref.kind === "opencode") return path.basename(ref.path, ".json");
   if (ref.kind === "grok") return path.basename(ref.path);
+  if (ref.kind === "hermes") return parseHermesRefPath(ref.path).sessionId;
   return path.basename(ref.path, ".jsonl");
 }
 
-/** All ingestable transcripts across Claude Code, Codex, OpenCode, and Grok Build, tagged by kind. */
+/** All ingestable transcripts across Claude Code, Codex, OpenCode, Grok Build, and Hermes, tagged by kind. */
 export async function listAllTranscripts(): Promise<TranscriptRef[]> {
-  const [claude, codex, opencode, grok] = await Promise.all([
+  const [claude, codex, opencode, grok, hermes] = await Promise.all([
     listConversationFiles(),
     listCodexFiles(),
     listOpencodeFiles(),
     listGrokFiles(),
+    listHermesFiles(),
   ]);
   return [
     ...claude.map((p): TranscriptRef => ({ path: p, kind: "claude" })),
     ...codex.map((p): TranscriptRef => ({ path: p, kind: "codex" })),
     ...opencode.map((p): TranscriptRef => ({ path: p, kind: "opencode" })),
     ...grok.map((p): TranscriptRef => ({ path: p, kind: "grok" })),
+    ...hermes,
   ];
 }
 
@@ -711,7 +742,275 @@ export function parseAny(ref: TranscriptRef): Promise<ParsedTranscript> {
   if (ref.kind === "codex") return parseCodexTranscript(ref.path);
   if (ref.kind === "opencode") return parseOpencodeTranscript(ref.path);
   if (ref.kind === "grok") return parseGrokTranscript(ref.path);
+  if (ref.kind === "hermes") return parseHermesTranscript(ref.path);
   return parseTranscript(ref.path);
+}
+
+// ─── Hermes Agent ────────────────────────────────────────────────────────────
+
+/** Files that gate incremental backfill for one Hermes session (the shared state.db). */
+export function listHermesUnitFiles(refPath: string): string[] {
+  const { dbPath } = parseHermesRefPath(refPath);
+  return fs.existsSync(dbPath) ? [dbPath] : [];
+}
+
+/**
+ * Top-level Hermes sessions from `state.db`. Child sessions (`parent_session_id` set) are
+ * folded into their parent at parse time, so they are not listed alone.
+ */
+export async function listHermesFiles(): Promise<TranscriptRef[]> {
+  const dbPath = getHermesStateDb();
+  if (!fs.existsSync(dbPath)) return [];
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch {
+    return [];
+  }
+  try {
+    const rows = db
+      .prepare(
+        `SELECT id FROM sessions
+         WHERE parent_session_id IS NULL
+         ORDER BY started_at ASC`,
+      )
+      .all() as Array<{ id: string }>;
+    return rows
+      .filter((r) => typeof r.id === "string" && r.id)
+      .map((r) => ({ path: hermesRefPath(dbPath, r.id), kind: "hermes" as const }));
+  } catch {
+    return [];
+  } finally {
+    db.close();
+  }
+}
+
+/** Convert Hermes REAL timestamps (unix seconds, sometimes fractional) to ISO, or "". */
+function hermesTs(raw: unknown): string {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const ms = raw > 1e12 ? raw : raw * 1000;
+    return new Date(ms).toISOString();
+  }
+  if (typeof raw === "string" && raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) {
+      const ms = n > 1e12 ? n : n * 1000;
+      return new Date(ms).toISOString();
+    }
+    const d = Date.parse(raw);
+    if (!Number.isNaN(d)) return new Date(d).toISOString();
+  }
+  return "";
+}
+
+interface HermesToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+/** Parse Hermes `messages.tool_calls` JSON into name + args objects. */
+function parseHermesToolCalls(raw: unknown): HermesToolCall[] {
+  if (raw == null || raw === "" || raw === "[]") return [];
+  let parsed: unknown;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: HermesToolCall[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const obj = item as {
+      type?: unknown;
+      name?: unknown;
+      function?: { name?: unknown; arguments?: unknown };
+      arguments?: unknown;
+    };
+    const name =
+      (obj.function && typeof obj.function.name === "string" && obj.function.name) ||
+      (typeof obj.name === "string" ? obj.name : "");
+    if (!name) continue;
+    let args: Record<string, unknown> = {};
+    const argSrc = obj.function?.arguments ?? obj.arguments;
+    if (typeof argSrc === "string" && argSrc) {
+      try {
+        const a = JSON.parse(argSrc);
+        if (a && typeof a === "object" && !Array.isArray(a)) args = a as Record<string, unknown>;
+      } catch {
+        args = {};
+      }
+    } else if (argSrc && typeof argSrc === "object" && !Array.isArray(argSrc)) {
+      args = argSrc as Record<string, unknown>;
+    }
+    out.push({ name, args });
+  }
+  return out;
+}
+
+/** Render a Hermes tool's verbatim input (scripts/code we keep), or null to skip. */
+function renderHermesTool(name: string, args: Record<string, unknown>): string | null {
+  const file =
+    typeof args.path === "string" ? args.path : typeof args.file === "string" ? args.file : "";
+  const keep = (label: string, body: string): string | null =>
+    !body || looksBinary(body) ? null : `「${label}」\n${body}`;
+
+  if (name === "terminal" && typeof args.command === "string") return keep("terminal", args.command);
+  if (name === "write_file" && typeof args.content === "string") {
+    return keep(`write_file ${file}`.trim(), args.content);
+  }
+  if (name === "patch") {
+    const body =
+      typeof args.new_string === "string"
+        ? args.new_string
+        : typeof args.content === "string"
+          ? args.content
+          : "";
+    return keep(`patch ${file}`.trim(), body);
+  }
+  return null;
+}
+
+/**
+ * Parse one Hermes session (and any child sessions linked via `parent_session_id`) from
+ * `state.db`. Tool *outputs* (role=tool) and reasoning columns are dropped; file/shell
+ * tool calls become toolEvents + verbatim bodies on the assistant message.
+ */
+export async function parseHermesTranscript(refPath: string): Promise<ParsedTranscript> {
+  const { dbPath, sessionId } = parseHermesRefPath(refPath);
+  const empty: ParsedTranscript = {
+    sessionId,
+    title: null,
+    toolEvents: [],
+    userTurns: [],
+    messages: [],
+    framing: null,
+  };
+  if (!sessionId || !fs.existsSync(dbPath)) return empty;
+
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch {
+    return empty;
+  }
+
+  try {
+    const session = db
+      .prepare(`SELECT id, title, cwd FROM sessions WHERE id = ?`)
+      .get(sessionId) as { id: string; title: string | null; cwd: string | null } | undefined;
+    if (!session) return empty;
+
+    const title = typeof session.title === "string" && session.title ? session.title : null;
+    const cwd = typeof session.cwd === "string" && session.cwd ? session.cwd : null;
+
+    // Fold one level of descendants (and deeper) under the parent session id.
+    const familyIds = (
+      db
+        .prepare(
+          `WITH RECURSIVE family AS (
+             SELECT id FROM sessions WHERE id = ?
+             UNION ALL
+             SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id = f.id
+           )
+           SELECT id FROM family`,
+        )
+        .all(sessionId) as Array<{ id: string }>
+    ).map((r) => r.id);
+
+    const placeholders = familyIds.map(() => "?").join(",");
+    const rows = db
+      .prepare(
+        `SELECT role, content, tool_calls, timestamp, active
+         FROM messages
+         WHERE session_id IN (${placeholders})
+           AND COALESCE(active, 1) = 1
+           AND role IN ('user', 'assistant')
+         ORDER BY timestamp ASC, id ASC`,
+      )
+      .all(...familyIds) as Array<{
+      role: string;
+      content: string | null;
+      tool_calls: string | null;
+      timestamp: number | null;
+      active: number | null;
+    }>;
+
+    const toolEvents: ToolEvent[] = [];
+    const userTurns: UserTurn[] = [];
+    const messages: ConvMessage[] = [];
+
+    for (const row of rows) {
+      const timestamp = hermesTs(row.timestamp);
+      const role: Role | null = row.role === "user" ? "user" : row.role === "assistant" ? "assistant" : null;
+      if (!role) continue;
+
+      const calls = role === "assistant" ? parseHermesToolCalls(row.tool_calls) : [];
+      for (const call of calls) {
+        if (call.name === "write_file" || call.name === "patch") {
+          const file =
+            typeof call.args.path === "string"
+              ? call.args.path
+              : typeof call.args.file === "string"
+                ? call.args.file
+                : null;
+          if (file) {
+            toolEvents.push({
+              tool: call.name,
+              file,
+              command: null,
+              branch: null,
+              cwd,
+              timestamp,
+            });
+          }
+        } else if (call.name === "terminal" && typeof call.args.command === "string") {
+          toolEvents.push({
+            tool: "terminal",
+            file: null,
+            command: call.args.command,
+            branch: null,
+            cwd,
+            timestamp,
+          });
+        }
+      }
+
+      const parts: string[] = [];
+      if (typeof row.content === "string" && row.content.trim()) parts.push(row.content);
+      for (const call of calls) {
+        const body = renderHermesTool(call.name, call.args);
+        if (body) parts.push(body);
+      }
+      const text = parts.join("\n").trim();
+
+      if (role === "user") {
+        const turn = (typeof row.content === "string" ? row.content : "").trim();
+        if (!turn || isNoiseUserText(turn)) continue;
+        userTurns.push({ text: turn, branch: null, timestamp });
+        messages.push({ role: "user", agent: null, agentId: null, branch: null, timestamp, text: turn });
+        continue;
+      }
+
+      // assistant
+      if (text) {
+        messages.push({ role: "assistant", agent: null, agentId: null, branch: null, timestamp, text });
+      }
+    }
+
+    return {
+      sessionId,
+      title,
+      toolEvents,
+      userTurns,
+      messages,
+      framing: userTurns[0]?.text ?? null,
+    };
+  } catch {
+    return empty;
+  } finally {
+    db.close();
+  }
 }
 
 // ─── Grok Build ──────────────────────────────────────────────────────────────

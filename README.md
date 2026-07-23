@@ -3,20 +3,27 @@
 [![CI](https://github.com/divmgl/clancey/actions/workflows/ci.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/ci.yml)
 [![Publish to npm](https://github.com/divmgl/clancey/actions/workflows/publish.yml/badge.svg)](https://github.com/divmgl/clancey/actions/workflows/publish.yml)
 
-Clancey is a memory for your AI coding sessions. As you work it quietly records what each session did, the decisions you made, and the things you learned along the way.
+Clancey is a **shared conversation index** for AI coding tools. It imports what you already did in Claude Code, Grok Build, OpenCode, Codex, and Hermes into one place, so any of those agents can answer:
 
-Later you just ask your agent things like *"which conversation produced this PR, and why did we build it this way?"*, and it uses Clancey to find the session behind a branch or file, recall the reasoning, and read back what you actually said.
+- *"Which conversation produced the `feature/auth` branch?"*
+- *"What did we say the last time we touched `GameRepository.ts`?"*
+- *"Why did we move auth to the edge — and in which client was that decided?"*
+
+You ask your current agent; it looks up the session across every client Clancey knows about, then reads back what was actually said.
 
 ## Supported tools
 
-| Tool | MCP | Skill | History import | Live tool events |
-|------|-----|-------|----------------|------------------|
-| **Claude Code** | yes | yes | yes | silent live capture |
-| **Grok Build** | yes | yes | yes | silent live capture |
-| **OpenCode** | yes | yes | yes | plugin |
-| **Codex** | yes | yes | yes | poller while MCP runs |
+| Tool | History import | Live capture | MCP + skill |
+|------|----------------|--------------|-------------|
+| **Claude Code** | yes | yes | yes |
+| **Grok Build** | yes | yes | yes |
+| **OpenCode** | yes | yes | yes |
+| **Codex** | yes | yes (while MCP runs) | yes |
+| **Hermes Agent** | yes | — (state.db) | yes |
 
-Decision and learning recording is driven by the **Clancey skill** (Agent Skills `SKILL.md`) that setup installs into each tool — the agent loads it and calls `record_decision` / `record_learning` as it works. Live capture of file edits and shell commands is silent infrastructure for search and branch mapping; it does not coach the agent.
+One store (`~/.clancey/`). Setup wires each tool’s MCP server and installs the **Clancey skill** so agents know how to look things up. Live capture of file edits and shell commands is silent infrastructure for branch/file mapping — it does not coach the agent.
+
+Optional: as you work, the skill can also have the agent record decisions and learnings so semantic search is richer later. Lookup works without that; imported transcripts are enough.
 
 ## Prerequisites
 
@@ -29,19 +36,25 @@ Decision and learning recording is driven by the **Clancey skill** (Agent Skills
 npx -y clancey setup
 ```
 
-Setup asks which tools to enable Clancey for, then imports your existing history from each so you can ask about it right away. Restart your tools when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
+Setup asks which tools to enable, imports existing history from each so you can ask about it immediately, and installs the Clancey skill. Restart your tools when it finishes. The first run downloads a small embedding model (~30 MB), cached afterward.
 
 ## Using it
 
-You never call Clancey directly. Your agent does, whenever you ask it about past work. Try:
+You never call Clancey directly. Your agent does, whenever you ask about past work — including work that happened in a *different* coding client than the one you’re in now.
 
-- *"Which conversation produced the `feature/auth` branch?"*
-- *"Why did we move auth to the edge?"*
+**Things you can ask:**
+
+- *"Which conversation produced this PR?"* / *"…the `feature/auth` branch?"*
 - *"What was I thinking the last time I changed `GameRepository.ts`?"*
+- *"What did we do in this repo recently?"*
+- *"What did Codex do on `feat` last week?"* (or Claude, Grok, OpenCode, Hermes)
+- *"Search everything we said about edge auth a week ago."* / *"…yesterday."* / *"…in the last 7 days."*
 
-As you work, the agent records the decisions it makes and the incidental things it learns about your system — gotchas, constraints, how a subsystem actually behaves — so both are searchable later, and it can revise or drop any of them when one was wrong or duplicated. You can also ask it to go back through your older sessions and fill in the decisions it finds, so even history from before you installed Clancey becomes useful.
+Clancey can scope by **repo**, **branch**, **which coding tool**, and **plain-English time** (“last week”, “a week ago”, “yesterday”). It can list recent sessions, open the full transcript (including subagent turns), and fall back to a snapshot if the original chat file was pruned.
 
-Recall is semantic, so it finds things by meaning even when you don't remember the exact words. When something was only ever said in passing — never recorded as a decision — the agent falls back to a plain keyword search over the verbatim conversation, so an offhand remark is still findable by the words you used.
+If something you just finished doesn’t show up yet, ask the agent to refresh the index (or run `npx clancey backfill` yourself).
+
+**Optional enrichment:** as you work, the agent may record decisions and learnings (commits, PRs, root causes, approach choices) so later search is sharper. You can also ask it to mine older sessions for decisions after the fact. Lookup works without that — imported history is enough.
 
 ## Keep your history
 
@@ -60,10 +73,10 @@ You only ever run `setup` by hand; your agent runs everything else for you. Setu
 
 ```
 npx clancey setup       Set up Clancey and import history (run once)
-npx clancey backfill    Re-import existing conversations
+npx clancey backfill    Re-import / refresh the conversation index
 ```
 
-Run `npx clancey --help` for the full list. Everything Clancey stores lives in `~/.clancey/`.
+Your agent can also refresh the index from inside a session when results look stale. Run `npx clancey --help` for the full list. Everything Clancey stores lives in `~/.clancey/`.
 
 ## Development
 

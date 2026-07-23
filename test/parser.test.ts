@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   decodeClaudeProject,
@@ -7,10 +7,18 @@ import {
   parseCodexTranscript,
   parseOpencodeTranscript,
   parseGrokTranscript,
+  parseHermesTranscript,
+  listHermesFiles,
   listSubagents,
   parseSubagent,
+  hermesRefPath,
+  sessionIdOf,
+  parseAny,
 } from "../src/parser.ts";
 import path from "path";
+import fs from "fs";
+import os from "os";
+import Database from "better-sqlite3";
 
 describe("decodeClaudeProject", () => {
   test("decodes a leading dash into / and replaces dashes with /", () => {
@@ -274,5 +282,228 @@ describe("parseGrokTranscript", () => {
     });
     assert.equal(t.sessionId, "parent_session");
     assert.ok(t.messages.every((m) => m.agent === "general-purpose" && m.agentId === "sub-1"));
+  });
+});
+
+/** Build a minimal Hermes state.db fixture and return { home, dbPath, sessionId, ...fixture fields }. */
+function buildHermesFixture(home: string): {
+  dbPath: string;
+  sessionId: string;
+  title: string;
+  cwd: string;
+  framing: string;
+  assistantProse: string;
+  terminalCmd: string;
+  writePath: string;
+  writeBody: string;
+  patchPath: string;
+  patchBody: string;
+  userTs: number;
+  assistantTs: number;
+} {
+  fs.mkdirSync(home, { recursive: true });
+  const dbPath = path.join(home, "state.db");
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      parent_session_id TEXT,
+      started_at REAL NOT NULL,
+      cwd TEXT,
+      title TEXT
+    );
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT,
+      tool_calls TEXT,
+      timestamp REAL NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+  `);
+
+  const sessionId = "ses_hermes_auth";
+  const title = "Hermes auth refactor";
+  const cwd = "/repo/hermes-project";
+  const framing = "We need to refactor the auth module because it is tangled and hard to test.";
+  const assistantProse = "I'll extract the token path and write a helper.";
+  const terminalCmd = "bun test src/auth.test.ts";
+  const writePath = "/repo/hermes-project/src/auth.ts";
+  const writeBody = "export function refreshToken() { return true; }\n";
+  const patchPath = "/repo/hermes-project/src/auth.ts";
+  const patchBody = "export function refreshToken() { return refresh(); }\n";
+  const userTs = 1_700_000_000;
+  const assistantTs = 1_700_000_010;
+
+  db.prepare(
+    `INSERT INTO sessions (id, source, parent_session_id, started_at, cwd, title)
+     VALUES (?, 'cli', NULL, ?, ?, ?)`,
+  ).run(sessionId, userTs, cwd, title);
+
+  // Child session folded under parent — should not appear as its own list entry.
+  db.prepare(
+    `INSERT INTO sessions (id, source, parent_session_id, started_at, cwd, title)
+     VALUES (?, 'cli', ?, ?, ?, ?)`,
+  ).run("ses_hermes_child", sessionId, userTs + 100, cwd, "child continue");
+
+  db.prepare(
+    `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+     VALUES (?, 'user', ?, NULL, ?, 1)`,
+  ).run(sessionId, framing, userTs);
+
+  const toolCalls = JSON.stringify([
+    {
+      id: "call-term-1",
+      type: "function",
+      function: { name: "terminal", arguments: JSON.stringify({ command: terminalCmd }) },
+    },
+    {
+      id: "call-write-1",
+      type: "function",
+      function: {
+        name: "write_file",
+        arguments: JSON.stringify({ path: writePath, content: writeBody }),
+      },
+    },
+    {
+      id: "call-patch-1",
+      type: "function",
+      function: {
+        name: "patch",
+        arguments: JSON.stringify({
+          mode: "replace",
+          path: patchPath,
+          old_string: writeBody,
+          new_string: patchBody,
+        }),
+      },
+    },
+  ]);
+
+  db.prepare(
+    `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+     VALUES (?, 'assistant', ?, ?, ?, 1)`,
+  ).run(sessionId, assistantProse, toolCalls, assistantTs);
+
+  // Tool output noise — must be dropped.
+  db.prepare(
+    `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+     VALUES (?, 'tool', ?, NULL, ?, 1)`,
+  ).run(sessionId, "bun test passed", assistantTs + 1);
+
+  // Child user turn folded into parent parse.
+  db.prepare(
+    `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+     VALUES (?, 'user', ?, NULL, ?, 1)`,
+  ).run("ses_hermes_child", "Also add a unit test for the refresh path please.", userTs + 100);
+
+  db.close();
+  return {
+    dbPath,
+    sessionId,
+    title,
+    cwd,
+    framing,
+    assistantProse,
+    terminalCmd,
+    writePath,
+    writeBody,
+    patchPath,
+    patchBody,
+    userTs,
+    assistantTs,
+  };
+}
+
+describe("parseHermesTranscript", () => {
+  let tmp: string;
+  let prevHermes: string | undefined;
+  let fx: ReturnType<typeof buildHermesFixture>;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-hermes-parse-"));
+    prevHermes = process.env.HERMES_HOME;
+    process.env.HERMES_HOME = tmp;
+    fx = buildHermesFixture(tmp);
+  });
+
+  afterEach(() => {
+    if (prevHermes === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHermes;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("lists only top-level sessions and resolves session id from the ref path", async () => {
+    const refs = await listHermesFiles();
+    assert.equal(refs.length, 1);
+    assert.equal(refs[0].kind, "hermes");
+    assert.equal(sessionIdOf(refs[0]), fx.sessionId);
+    assert.equal(refs[0].path, hermesRefPath(fx.dbPath, fx.sessionId));
+  });
+
+  test("reads title, session id, framing, and cwd from the fixture DB", async () => {
+    const ref = hermesRefPath(fx.dbPath, fx.sessionId);
+    const t = await parseHermesTranscript(ref);
+    assert.equal(t.sessionId, fx.sessionId);
+    assert.equal(t.title, fx.title);
+    assert.equal(t.framing, fx.framing);
+    assert.equal(t.userTurns[0]?.text, fx.framing);
+  });
+
+  test("extracts terminal command and write_file/patch file events with session cwd", async () => {
+    const t = await parseHermesTranscript(hermesRefPath(fx.dbPath, fx.sessionId));
+    const ts = new Date(fx.assistantTs * 1000).toISOString();
+    assert.deepEqual(t.toolEvents, [
+      {
+        tool: "terminal",
+        file: null,
+        command: fx.terminalCmd,
+        branch: null,
+        cwd: fx.cwd,
+        timestamp: ts,
+      },
+      {
+        tool: "write_file",
+        file: fx.writePath,
+        command: null,
+        branch: null,
+        cwd: fx.cwd,
+        timestamp: ts,
+      },
+      {
+        tool: "patch",
+        file: fx.patchPath,
+        command: null,
+        branch: null,
+        cwd: fx.cwd,
+        timestamp: ts,
+      },
+    ]);
+  });
+
+  test("keeps user/assistant prose and verbatim tool bodies; drops tool outputs", async () => {
+    const t = await parseHermesTranscript(hermesRefPath(fx.dbPath, fx.sessionId));
+    const all = t.messages.map((m) => m.text).join("\n");
+    assert.ok(all.includes(fx.framing));
+    assert.ok(all.includes(fx.assistantProse));
+    assert.ok(all.includes(`「terminal」\n${fx.terminalCmd}`));
+    assert.ok(all.includes(`「write_file ${fx.writePath}」`) && all.includes(fx.writeBody.trim()));
+    assert.ok(all.includes(`「patch ${fx.patchPath}」`) && all.includes(fx.patchBody.trim()));
+    assert.ok(!all.includes("bun test passed"), "tool role outputs must be dropped");
+  });
+
+  test("folds child-session messages under the parent session id", async () => {
+    const t = await parseHermesTranscript(hermesRefPath(fx.dbPath, fx.sessionId));
+    assert.ok(t.userTurns.some((u) => u.text.includes("unit test for the refresh path")));
+    assert.equal(t.sessionId, fx.sessionId);
+  });
+
+  test("parseAny routes hermes refs through the Hermes parser", async () => {
+    const ref = { path: hermesRefPath(fx.dbPath, fx.sessionId), kind: "hermes" as const };
+    const t = await parseAny(ref);
+    assert.equal(t.sessionId, fx.sessionId);
+    assert.equal(t.framing, fx.framing);
   });
 });

@@ -15,23 +15,29 @@ import {
   recall,
   search,
   grepTurns,
+  listRecentSessions,
   getMessages,
   pruneOlderThan,
   getRetentionDays,
   setMeta,
   storeTotals,
+  normalizeHost,
   WorkItem,
   SearchHit,
   TurnHit,
   StoredMessage,
+  SessionSummary,
 } from "./store.js";
-import { resolveSession, parseAny, listSubagents, parseSubagent, ConvMessage } from "./parser.js";
+import { resolveSession, parseAny, listSubagents, parseSubagent, listGrokSubagents, ConvMessage } from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { runHook } from "./hook.js";
 import { setup, backfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import { resolveTimeFilter } from "./time.js";
 import { startCodexLiveCapture } from "./codex-live.js";
+
+const EMPTY_LOOKUP_HINT =
+  "No matches. If this work just happened or a recent session is missing, call refresh_index (or run `clancey backfill`) and try again.";
 
 function getServerVersion(): string {
   try {
@@ -47,11 +53,12 @@ function text(s: string) {
 }
 
 function formatWorkItems(items: WorkItem[]): string {
-  if (items.length === 0) return "No matching work found.";
+  if (items.length === 0) return EMPTY_LOOKUP_HINT;
   return items
     .map((w) => {
+      const hostBit = w.hosts.length ? ` · hosts: ${w.hosts.join(", ")}` : "";
       const lines = [
-        `### ${w.branch ?? "(no branch)"}  ·  ${w.repo ?? "(no repo)"}`,
+        `### ${w.branch ?? "(no branch)"}  ·  ${w.repo ?? "(no repo)"}${hostBit}`,
         `- sessions: ${w.sessions.join(", ") || "(none)"}`,
         `- files (${w.files.length}): ${w.files.slice(0, 30).join(", ")}${w.files.length > 30 ? ", …" : ""}`,
         `- ${w.toolEventCount} tool events · ${w.firstTs} → ${w.lastTs}`,
@@ -59,13 +66,15 @@ function formatWorkItems(items: WorkItem[]): string {
       if (w.decisions.length) {
         lines.push(`- decisions:`);
         for (const d of w.decisions) {
-          lines.push(`  - [#${d.id}] ${d.decision}${d.why ? ` — ${d.why}` : ""}`);
+          const sess = d.session ? ` session=${d.session}` : "";
+          lines.push(`  - [#${d.id}]${sess} ${d.decision}${d.why ? ` — ${d.why}` : ""}`);
         }
       }
       if (w.learnings.length) {
         lines.push(`- learnings:`);
         for (const l of w.learnings) {
-          lines.push(`  - [#${l.id}] ${l.learning}${l.context ? ` — ${l.context}` : ""}`);
+          const sess = l.session ? ` session=${l.session}` : "";
+          lines.push(`  - [#${l.id}]${sess} ${l.learning}${l.context ? ` — ${l.context}` : ""}`);
         }
       }
       return lines.join("\n");
@@ -83,41 +92,153 @@ function speaker(h: TurnHit): string {
 }
 
 function formatTurnHits(hits: TurnHit[]): string {
-  if (hits.length === 0) {
-    return "No matching turns. (Only backfilled sessions are indexed — run `clancey backfill` if a recent session is missing.)";
-  }
+  if (hits.length === 0) return EMPTY_LOOKUP_HINT;
   return hits
-    .map(
-      (h, i) =>
-        `${i + 1}. (${h.branch ?? "?"}) [${speaker(h)}] session=${h.session} · ${h.ts}\n   ${h.snippet.replace(/\s+/g, " ").trim()}`,
-    )
+    .map((h, i) => {
+      const host = h.host ? ` host=${h.host}` : "";
+      return `${i + 1}. (${h.branch ?? "?"}) [${speaker(h)}] session=${h.session}${host} · ${h.ts}\n   ${h.snippet.replace(/\s+/g, " ").trim()}`;
+    })
     .join("\n\n");
 }
 
 function formatSearchHits(hits: SearchHit[]): string {
-  if (hits.length === 0) return "No results.";
+  if (hits.length === 0) return EMPTY_LOOKUP_HINT;
   return hits
-    .map(
-      (h, i) =>
-        `${i + 1}. [${h.score.toFixed(3)}] (${h.branch ?? "?"}, ${h.kind}) session=${h.session}\n   ${h.text.replace(/\s+/g, " ").slice(0, 280)}`,
-    )
+    .map((h, i) => {
+      const host = h.host ? `, ${h.host}` : "";
+      const sess = h.session ? ` session=${h.session}` : "";
+      return `${i + 1}. [${h.score.toFixed(3)}] (${h.branch ?? "?"}, ${h.kind}${host})${sess}\n   ${h.text.replace(/\s+/g, " ").slice(0, 280)}`;
+    })
     .join("\n\n");
 }
+
+function formatSessions(rows: SessionSummary[]): string {
+  if (rows.length === 0) return EMPTY_LOOKUP_HINT;
+  return rows
+    .map(
+      (s, i) =>
+        `${i + 1}. session=${s.session} host=${s.host ?? "?"} repo=${s.repo ?? "?"} branch=${s.branch ?? "?"} · ${s.firstTs} → ${s.lastTs}`,
+    )
+    .join("\n");
+}
+
+const SCOPE_PROPS = {
+  repo: { type: "string", description: "Limit to this repo key (owner/name or path)" },
+  branch: { type: "string", description: "Exact branch name" },
+  host: {
+    type: "string",
+    description: "Coding host: claude | codex | opencode | grok",
+  },
+  since: { type: "string", description: "ISO timestamp lower bound" },
+  until: { type: "string", description: "ISO timestamp exclusive upper bound" },
+  time: {
+    type: "string",
+    description:
+      "Natural-language time window, e.g. 'last week', 'a week ago', 'yesterday', or 'Sep 12-13'. Explicit since/until override this.",
+  },
+  limit: { type: "number", description: "Max results" },
+} as const;
 
 function buildServer(db: Store): Server {
   const server = new Server({ name: "clancey", version: getServerVersion() }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    // Lookup tools first — Clancey's primary job is cross-client conversation recovery.
     tools: [
+      {
+        name: "recall",
+        description:
+          "Find which coding sessions produced a branch, file, or repo across hosts. Returns sessions, files, hosts, and any recorded decisions/learnings (with session ids when stored). Start here to map a PR or path back to the conversation.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ...SCOPE_PROPS,
+            file: { type: "string", description: "Substring of an edited file path" },
+            limit: { type: "number", description: "Max work items (default: all)" },
+          },
+        },
+      },
+      {
+        name: "search",
+        description:
+          "Semantic search over session framings and recorded decisions/learnings, ranked by similarity. Scope with repo/branch/host/time. If it misses, fall back to grep_turns.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Natural-language semantic query, without date/window words when using time filters",
+            },
+            ...SCOPE_PROPS,
+            limit: { type: "number", description: "Max results (default: 8)" },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "grep_turns",
+        description:
+          "Keyword/full-text search over the full verbatim conversation — including subagent turns (labeled assistant·AgentType). Scope with repo/branch/host/time. Each hit carries session (and host when known) for read_turns.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Keywords to match, without date/window words when using time filters",
+            },
+            ...SCOPE_PROPS,
+            limit: { type: "number", description: "Max results (default: 8)" },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "list_sessions",
+        description:
+          "List recent sessions by last activity. Filter by repo, branch, host, and/or time. Use a returned session id with read_turns.",
+        inputSchema: {
+          type: "object",
+          properties: { ...SCOPE_PROPS, limit: { type: "number", description: "Max sessions (default: 20)" } },
+        },
+      },
+      {
+        name: "read_turns",
+        description:
+          "Read the full verbatim conversation from a session (main + subagents, labeled by speaker). Optionally only the branch slice. If the live transcript was pruned, serves the stored snapshot.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session: { type: "string", description: "Session id" },
+            branch: { type: "string", description: "Only turns recorded on this branch" },
+          },
+          required: ["session"],
+        },
+      },
+      {
+        name: "refresh_index",
+        description:
+          "Re-ingest changed coding-agent transcripts into Clancey so recent work is findable. Call when lookup looks stale or empty for work that should exist.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            force: {
+              type: "boolean",
+              description: "Re-ingest everything, ignoring the mtime cache (default false)",
+            },
+          },
+        },
+      },
       {
         name: "record_decision",
         description:
-          "Record a significant decision and its rationale, anchored to the current repo and branch. Capture the why and the alternatives rejected, not just what changed. (When to call this is defined by the Clancey skill.)",
+          "Optional: record a significant decision (why + alternatives rejected), anchored to repo/branch and optionally session/host, so future search is sharper.",
         inputSchema: {
           type: "object",
           properties: {
             repo: { type: "string", description: "Repo key (e.g. owner/name from git remote, or absolute path)" },
             branch: { type: "string", description: "Current git branch" },
+            session: { type: "string", description: "Session id this decision came from" },
+            host: { type: "string", description: "Coding host: claude | codex | opencode | grok" },
             decision: { type: "string", description: "What was decided" },
             why: { type: "string", description: "Rationale and alternatives rejected" },
             files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
@@ -128,7 +249,7 @@ function buildServer(db: Store): Server {
       {
         name: "update_decision",
         description:
-          "Revise a recorded decision by its id (from recall). Pass the new decision and/or why; the embedding is re-generated so search reflects the edit. Use this to fix or rephrase a decision instead of recording a duplicate.",
+          "Revise a recorded decision by its id (from recall). Pass the new decision and/or why; the embedding is re-generated so search reflects the edit.",
         inputSchema: {
           type: "object",
           properties: {
@@ -142,7 +263,7 @@ function buildServer(db: Store): Server {
       {
         name: "remove_decision",
         description:
-          "Delete a recorded decision by its id (from recall), including its embedding. Use this to drop a wrong or duplicate decision so it stops surfacing in recall and search.",
+          "Delete a recorded decision by its id (from recall), including its embedding.",
         inputSchema: {
           type: "object",
           properties: {
@@ -154,12 +275,14 @@ function buildServer(db: Store): Server {
       {
         name: "record_learning",
         description:
-          "Record an incidental learning — a non-obvious fact about the system (a gotcha, a constraint, how a subsystem actually behaves) — anchored to the current repo and branch. Separate from decisions: not what you chose, but what you found out. (When to call this is defined by the Clancey skill.)",
+          "Optional: record an incidental learning, anchored to repo/branch and optionally session/host.",
         inputSchema: {
           type: "object",
           properties: {
             repo: { type: "string", description: "Repo key (e.g. owner/name from git remote, or absolute path)" },
             branch: { type: "string", description: "Current git branch" },
+            session: { type: "string", description: "Session id this learning came from" },
+            host: { type: "string", description: "Coding host: claude | codex | opencode | grok" },
             learning: { type: "string", description: "What you learned" },
             context: { type: "string", description: "Where it applies and why it matters" },
             files: { type: "array", items: { type: "string" }, description: "Relevant file paths" },
@@ -170,7 +293,7 @@ function buildServer(db: Store): Server {
       {
         name: "update_learning",
         description:
-          "Revise a recorded learning by its id (from recall). Pass the new learning and/or context; the embedding is re-generated so search reflects the edit. Use this to fix or rephrase a learning instead of recording a duplicate.",
+          "Revise a recorded learning by its id (from recall). Pass the new learning and/or context; the embedding is re-generated.",
         inputSchema: {
           type: "object",
           properties: {
@@ -183,76 +306,13 @@ function buildServer(db: Store): Server {
       },
       {
         name: "remove_learning",
-        description:
-          "Delete a recorded learning by its id (from recall), including its embedding. Use this to drop a wrong or duplicate learning so it stops surfacing in recall and search.",
+        description: "Delete a recorded learning by its id (from recall), including its embedding.",
         inputSchema: {
           type: "object",
           properties: {
             id: { type: "number", description: "Learning id, shown as [#id] in recall output" },
           },
           required: ["id"],
-        },
-      },
-      {
-        name: "recall",
-        description:
-          "Deterministically find the work (sessions, files, recorded decisions and learnings) for a branch, file, or repo. Use this to map a PR (its branch or changed files) to the sessions that produced it.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            repo: { type: "string" },
-            branch: { type: "string", description: "Exact branch name, e.g. a PR head ref" },
-            file: { type: "string", description: "Substring of an edited file path" },
-            since: { type: "string", description: "ISO timestamp lower bound" },
-            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
-            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
-            limit: { type: "number", description: "Max work items (default: all)" },
-          },
-        },
-      },
-      {
-        name: "search",
-        description:
-          "Semantic search over recorded decisions, learnings, and session framings, ranked by similarity (descending). Use for the open case: 'what did I decide about X' or 'what did I learn about X' when you don't know the branch. Only covers what was recorded or framed — if it misses, fall back to grep_turns for literal keyword search over the raw conversation.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Natural-language semantic query, without date/window words when using time filters" },
-            since: { type: "string", description: "ISO timestamp lower bound" },
-            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
-            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
-            limit: { type: "number", description: "Max results (default: 8)" },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "grep_turns",
-        description:
-          "Keyword/full-text search over the full verbatim conversation — human prompts, the assistant's prose, the scripts/code it wrote, and subagent turns — the fallback when `search` (semantic) misses something said or done in passing that was never recorded as a decision or learning. Matches any of the query words, best matches first, so a turn hitting most of them still surfaces. Each hit is labelled by speaker (user, assistant, or assistant·<AgentType> for a subagent) and carries its session, so you can then read_turns that session for full context.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Keywords to match, without date/window words when using time filters" },
-            since: { type: "string", description: "ISO timestamp lower bound" },
-            until: { type: "string", description: "ISO timestamp exclusive upper bound" },
-            time: { type: "string", description: "Natural-language time window, e.g. 'last week', 'yesterday', or 'Sep 12-13'. Explicit since/until override this." },
-            limit: { type: "number", description: "Max results (default: 8)" },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "read_turns",
-        description:
-          "Read the full verbatim conversation from a session — human prompts, the assistant's prose, the scripts/code it wrote, and subagent turns, all in time order and labelled by speaker — optionally only the slice where a given branch was active. The deep dive that recovers a PR's motivation and exactly what was built, not just what was asked.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            session: { type: "string", description: "Session id" },
-            branch: { type: "string", description: "Only turns recorded on this branch" },
-          },
-          required: ["session"],
         },
       },
     ],
@@ -267,13 +327,37 @@ function buildServer(db: Store): Server {
           if (!decision) return { ...text("Error: decision is required"), isError: true };
           const repo = (args.repo as string) ?? null;
           const branch = (args.branch as string) ?? null;
+          const session = (args.session as string) ?? null;
+          const host = normalizeHost(args.host as string | undefined);
           const why = (args.why as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
-          const id = insertNote(db, { kind: "decision", session: null, repo, branch, body: decision, detail: why, files, ts });
+          const id = insertNote(db, {
+            kind: "decision",
+            session,
+            repo,
+            branch,
+            body: decision,
+            detail: why,
+            files,
+            ts,
+            host,
+          });
           const vector = await embedOne(noteEmbedInput(decision, why));
-          insertEmbedding(db, { session: "", repo, branch, kind: "decision", text: noteText(decision, why), vector, ts, eventId: id });
-          return text(`Recorded decision #${id} on ${branch ?? "(no branch)"}.`);
+          insertEmbedding(db, {
+            session: session ?? "",
+            repo,
+            branch,
+            kind: "decision",
+            text: noteText(decision, why),
+            vector,
+            ts,
+            eventId: id,
+            host,
+          });
+          return text(
+            `Recorded decision #${id} on ${branch ?? "(no branch)"}${session ? ` session=${session}` : ""}.`,
+          );
         }
         case "update_decision": {
           const id = Number(args.id);
@@ -299,13 +383,37 @@ function buildServer(db: Store): Server {
           if (!learning) return { ...text("Error: learning is required"), isError: true };
           const repo = (args.repo as string) ?? null;
           const branch = (args.branch as string) ?? null;
+          const session = (args.session as string) ?? null;
+          const host = normalizeHost(args.host as string | undefined);
           const context = (args.context as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
-          const id = insertNote(db, { kind: "learning", session: null, repo, branch, body: learning, detail: context, files, ts });
+          const id = insertNote(db, {
+            kind: "learning",
+            session,
+            repo,
+            branch,
+            body: learning,
+            detail: context,
+            files,
+            ts,
+            host,
+          });
           const vector = await embedOne(noteEmbedInput(learning, context));
-          insertEmbedding(db, { session: "", repo, branch, kind: "learning", text: noteText(learning, context), vector, ts, eventId: id });
-          return text(`Recorded learning #${id} on ${branch ?? "(no branch)"}.`);
+          insertEmbedding(db, {
+            session: session ?? "",
+            repo,
+            branch,
+            kind: "learning",
+            text: noteText(learning, context),
+            vector,
+            ts,
+            eventId: id,
+            host,
+          });
+          return text(
+            `Recorded learning #${id} on ${branch ?? "(no branch)"}${session ? ` session=${session}` : ""}.`,
+          );
         }
         case "update_learning": {
           const id = Number(args.id);
@@ -337,6 +445,7 @@ function buildServer(db: Store): Server {
             repo: args.repo as string | undefined,
             branch: args.branch as string | undefined,
             file: args.file as string | undefined,
+            host: args.host as string | undefined,
             ...time.filter,
             limit: args.limit as number | undefined,
           });
@@ -352,10 +461,16 @@ function buildServer(db: Store): Server {
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
           const vector = await embedOne(query);
-          const hits = search(db, vector, { limit: (args.limit as number) ?? 8, ...time.filter });
+          const hits = search(db, vector, {
+            limit: (args.limit as number) ?? 8,
+            repo: args.repo as string | undefined,
+            branch: args.branch as string | undefined,
+            host: args.host as string | undefined,
+            ...time.filter,
+          });
           let out = formatSearchHits(hits);
           const top = hits[0]?.score ?? 0;
-          if (top < LOW_CONFIDENCE) {
+          if (hits.length > 0 && top < LOW_CONFIDENCE) {
             out += `\n\n(low confidence — top score ${top.toFixed(3)}. For literal wording, try grep_turns({ query }) — keyword search over the raw conversation.)`;
           }
           return text(out);
@@ -369,7 +484,45 @@ function buildServer(db: Store): Server {
             until: args.until as string | undefined,
           });
           if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
-          return text(formatTurnHits(grepTurns(db, query, { limit: (args.limit as number) ?? 8, ...time.filter })));
+          return text(
+            formatTurnHits(
+              grepTurns(db, query, {
+                limit: (args.limit as number) ?? 8,
+                repo: args.repo as string | undefined,
+                branch: args.branch as string | undefined,
+                host: args.host as string | undefined,
+                ...time.filter,
+              }),
+            ),
+          );
+        }
+        case "list_sessions": {
+          const time = resolveTimeFilter({
+            time: args.time as string | undefined,
+            since: args.since as string | undefined,
+            until: args.until as string | undefined,
+          });
+          if (time.error) return { ...text(`Error: ${time.error}`), isError: true };
+          return text(
+            formatSessions(
+              listRecentSessions(db, {
+                limit: (args.limit as number) ?? 20,
+                repo: args.repo as string | undefined,
+                branch: args.branch as string | undefined,
+                host: args.host as string | undefined,
+                ...time.filter,
+              }),
+            ),
+          );
+        }
+        case "refresh_index": {
+          const force = Boolean(args.force);
+          const stats = await backfill(db, { force });
+          const totals = storeTotals(db);
+          return text(
+            `Index refreshed: ${stats.sessions} sessions, ${stats.events} events, ${stats.embeddings} embeddings ` +
+              `(totals: ${totals.sessions} sessions, ${totals.events} events, ${totals.embeddings} embeddings)`,
+          );
         }
         case "read_turns": {
           const session = args.session as string;
@@ -386,8 +539,13 @@ function buildServer(db: Store): Server {
           if (ref) {
             const parsed = await parseAny(ref);
             title = parsed.title;
-            // Fold in the live subagent transcripts so the full conversation is in time order.
-            const subs = ref.kind === "claude" ? await listSubagents(ref.path) : [];
+            // Fold in live subagent transcripts (Claude + Grok) so the full conversation is in time order.
+            const subs =
+              ref.kind === "claude"
+                ? await listSubagents(ref.path)
+                : ref.kind === "grok"
+                  ? await listGrokSubagents(ref.path)
+                  : [];
             const subMsgs = (await Promise.all(subs.map((s) => parseSubagent(s)))).flatMap((p) => p.messages);
             const all: ConvMessage[] = [...parsed.messages, ...subMsgs].sort((a, b) =>
               a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
@@ -405,7 +563,9 @@ function buildServer(db: Store): Server {
           }
 
           if (turns.length === 0) {
-            return text(`No turns${branch ? ` on branch ${branch}` : ""} found for session ${session}.`);
+            return text(
+              `No turns${branch ? ` on branch ${branch}` : ""} found for session ${session}. ${EMPTY_LOOKUP_HINT}`,
+            );
           }
           const note = pruned ? "\n(transcript pruned; served from snapshot)" : "";
           const header = `Session ${session}${branch ? ` (branch ${branch})` : ""} — ${turns.length} turns${title ? `\nTitle: ${title}` : ""}${note}`;
@@ -434,7 +594,7 @@ async function runServer(): Promise<void> {
   log(`MCP server running. Logs: ${LOG_FILE}`);
 }
 
-const HELP = `clancey — a memory for your AI coding sessions
+const HELP = `clancey — shared conversation index across AI coding clients
 
 Usage:
   clancey                 Start the MCP server over stdio
@@ -443,7 +603,7 @@ Usage:
   clancey prune           Drop conversation history older than the retention window
   clancey hook            Internal: silent live capture (reads stdin)
 
-Supports Claude Code, Codex, OpenCode, and Grok Build.
+Look up conversations from Claude Code, Codex, OpenCode, Grok Build, and Hermes in one store.
 
 Run "clancey <command> --help" for command-specific options.`;
 
@@ -461,13 +621,15 @@ Options:
 
 const SETUP_HELP = `clancey setup — wire clancey into your AI coding tools (global, idempotent)
 
-Every host gets the Clancey MCP server and the Clancey skill (Agent Skills SKILL.md) that
-tells the agent when to record decisions/learnings and how to recall past work.
+Primary goal: one conversation index across clients. Every host gets the Clancey MCP
+server and the Clancey skill (Agent Skills SKILL.md) that teaches agents how to look up
+past sessions (and optionally record decisions/learnings).
 
 Claude Code: MCP at user scope + skill in ~/.claude/skills/clancey/ + silent live-capture hooks.
 OpenCode: MCP + skill under ~/.config/opencode/ + live-recording plugin.
 Codex: MCP in ~/.codex/config.toml + skill in ~/.codex/skills/clancey/ (history import + live poller).
 Grok Build: MCP in ~/.grok/config.toml + skill in ~/.grok/skills/clancey/ + silent live-capture hooks.
+Hermes Agent: MCP in ~/.hermes/config.yaml + skill in ~/.hermes/skills/clancey/ (history import from state.db).
 
 All hosts are pinned to this install's absolute entrypoint (node + path to dist/index.js),
 not npx package specs. Re-run setup after upgrading clancey to re-pin every host.
@@ -477,7 +639,7 @@ detected host.
 
 Options:
   --tools <list>              Comma-separated tools to set up, non-interactively:
-                              claude, codex, opencode, grok, or all (e.g. --tools grok).
+                              claude, codex, opencode, grok, hermes, or all (e.g. --tools hermes).
                               Skips the picker. Default is the interactive picker; with
                               no TTY, all detected tools.
   --clean-legacy, --yes, -y   Delete the legacy v1 index (~/.clancey/conversations.lance)
@@ -511,14 +673,14 @@ function parseDays(args: string[]): number | undefined {
   return n;
 }
 
-/** Parse `--tools claude,codex,opencode,grok` (or `--tools=all`) into an explicit target list. */
+/** Parse `--tools claude,codex,opencode,grok,hermes` (or `--tools=all`) into an explicit target list. */
 function parseTools(args: string[]): Target[] | undefined {
   const eq = args.find((a) => a.startsWith("--tools="));
   const idx = args.indexOf("--tools");
   const raw = eq ? eq.slice("--tools=".length) : idx !== -1 ? args[idx + 1] : undefined;
   if (raw === undefined) return undefined;
 
-  const all: Target[] = ["claude", "codex", "opencode", "grok"];
+  const all: Target[] = ["claude", "codex", "opencode", "grok", "hermes"];
   const out = new Set<Target>();
   for (const part of raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
     if (part === "all") {
@@ -526,7 +688,7 @@ function parseTools(args: string[]): Target[] | undefined {
     } else if ((all as string[]).includes(part)) {
       out.add(part as Target);
     } else {
-      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, opencode, grok, all)`);
+      console.error(`Unknown tool "${part}" for --tools (expected: claude, codex, opencode, grok, hermes, all)`);
       process.exit(1);
     }
   }

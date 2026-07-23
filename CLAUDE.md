@@ -1,6 +1,6 @@
 # Clancey
 
-A memory for AI coding sessions. An MCP server (plus a thin operational CLI) that records what Claude Code, Grok Build, OpenCode, and Codex sessions did and the decisions made, so the agent can map a branch or file back to the conversation that produced it.
+A **shared conversation index** across AI coding clients. An MCP server (plus a thin operational CLI) that imports Claude Code, Grok Build, OpenCode, Codex, and Hermes sessions into one store so any of those agents can look up which conversation produced a branch, file, or PR — and read back what was actually said — regardless of which client the work happened in. Optional decision/learning recording enriches semantic search; it is not the product.
 
 ## Workflow — commit straight to `main`
 

@@ -57,6 +57,7 @@ function insertEvent(db: Store, session: string, event: ToolEvent): void {
     file: event.file,
     command: event.command,
     ts: event.timestamp || new Date().toISOString(),
+    host: "codex",
   });
 }
 

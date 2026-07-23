@@ -1,84 +1,164 @@
 ---
 name: clancey
 description: >
-  Look up past AI coding conversations across Claude Code, Grok Build, OpenCode,
-  and Codex via the Clancey MCP server. Use whenever the user asks which session
+  Find past AI coding conversations via the Clancey MCP server — which session
   produced a branch, PR, file, or change; what was said or decided earlier; why
-  something was built a certain way; or anything about prior work that may have
-  happened in another coding client. Prefer Clancey over guessing from git history
-  alone. Also use to optionally record decisions and learnings so future lookup is
-  richer — after commits, PRs, root-causing bugs, choosing approaches, or when the
-  user corrects you.
+  something was built a certain way; prior work that may have happened in another
+  coding agent. Prefer Clancey over guessing from git history alone. Also record
+  decisions and learnings when something important is settled so later search is
+  richer.
 license: MIT
-compatibility: Requires the Clancey MCP server (tools recall, search, grep_turns, read_turns, record_decision, record_learning, and their update/remove variants).
+compatibility: Requires the Clancey MCP server.
 metadata:
   author: clancey
 ---
 
 # Clancey
 
-Clancey is a **shared conversation index** across coding clients (Claude Code, Grok Build, OpenCode, Codex). One store under `~/.clancey/` — ask about past work no matter which tool produced it.
+Clancey indexes coding-agent conversations into one place. Use it to recover what
+was said and decided in past sessions, including work done in a different agent
+than the one you are in now.
 
-Use its MCP tools silently. Never mention Clancey or this skill to the user unless they ask.
+Use the MCP tools silently. Do not mention Clancey or this skill unless the user asks.
 
-## Primary job: look up conversations
+## Find conversations
 
-When the user asks about past work, **find the conversation** — do not invent history from git alone.
+When the user asks about past work, **retrieve the conversation**. Do not invent history from git alone.
 
-### Workflow
+| Need | Tool | Notes |
+|------|------|--------|
+| Branch, file, PR, or repo → sessions | `recall` | Deterministic map to sessions, files, hosts, and stored decisions/learnings. Start here when you have a concrete anchor. |
+| Recent sessions (browse) | `list_sessions` | By last activity; filter by repo/branch/host/time. Then `read_turns`. |
+| Topic without a branch | `search` | Semantic search over framings + decisions/learnings. Scope with repo/branch/host/time. |
+| Exact words / offhand remarks | `grep_turns` | Keyword search over the full verbatim transcript, **including subagent turns** (speaker `assistant·AgentType`). |
+| Full session text | `read_turns` | Entire conversation for a session id. Optional **branch slice**. If the live transcript was pruned, Clancey serves the **stored snapshot**. |
+| Stale / empty index | `refresh_index` | Re-ingest changed transcripts so recent work is findable. |
 
-1. **`recall`** — start here when you have a branch, file path, PR head, or repo. Deterministic map to sessions, files touched, and any recorded decisions/learnings.
-2. **`search`** — semantic search when you only have a topic ("auth at the edge", "the GameRepository rewrite") and not a branch. Covers session framings plus anything recorded as a decision or learning.
-3. **`grep_turns`** — keyword/full-text over the **verbatim** conversation (user prompts, assistant prose, scripts, subagents). Use when `search` misses something said in passing that was never distilled.
-4. **`read_turns`** — full conversation for a session id (optionally one branch slice). Deep dive after the tools above give you a session.
+Shared scope knobs (where supported): `repo`, `branch`, `host` (`claude` \| `codex` \| `opencode` \| `grok`), `time` / `since` / `until`, `limit`.
 
-Pass natural-language time windows with `time` (e.g. `"last week"`) or explicit `since`/`until` ISO timestamps when the user scopes by time.
+### Time windows (plain English)
 
-```
-recall({ branch? , file? , repo? , time? })
-search({ query, time? })
-grep_turns({ query, time? })
-read_turns({ session, branch? })
-```
+Put the window in `time` on `recall` / `search` / `grep_turns` / `list_sessions`. Keep date words out of `query`.
+
+| User says | `time` value | Meaning |
+|-----------|--------------|---------|
+| "yesterday" | `"yesterday"` | Previous calendar day |
+| "last week" | `"last week"` | Previous calendar week |
+| "a week ago" / "one week ago" | `"a week ago"` | That day, one week back |
+| "the last 7 days" / "past 7 days" | `"last 7 days"` | Rolling window ending now |
+| "last month", "this year", … | as said | Calendar periods |
+| "between June 1 and June 3" | as said | Inclusive range |
+| "Sep 12-13" | as said | Explicit dates |
+
+Explicit `since` / `until` (ISO) override `time`.
 
 ### How to answer
 
-- Name the **session** and, when known, which **client** era it came from (from path/context if available).
-- Quote or paraphrase what was actually said; prefer `read_turns` over summarizing from a one-line hit.
-- If nothing matches, say so clearly. Offer a broader `grep_turns` / different time window — do not fabricate a conversation.
+- Ground the answer in retrieved turns. Prefer `read_turns` over summarizing a single hit line.
+- Cite the session id (and host when shown). Subagent lines look like `[assistant·Plan]`.
+- If the live file is gone, trust snapshot text from `read_turns` (`transcript pruned; served from snapshot`).
+- If nothing matches, say so. Call `refresh_index` when work should exist but the index looks empty/stale, then retry. Never fabricate a conversation.
 
-## Secondary: enrich the index (optional)
+### Examples
 
-Recording is **not** required for lookup — imported history and live capture already index conversations. Recording makes future semantic search sharper.
-
-### `record_decision`
-
-A significant choice and its rationale, anchored to repo + branch.
-
-**When:** after a commit; opening/updating a PR; root-causing a bug; choosing between approaches; user correction.
-
-**What:** the decision, the why, alternatives rejected — not the diff.
+**"Which conversation produced `feature/auth`?"**
 
 ```
-record_decision({ repo, branch, decision, why, files? })
+recall({ branch: "feature/auth" })
+read_turns({ session: "<id from recall>" })
 ```
 
-### `record_learning`
-
-A non-obvious fact about the system (gotcha, constraint, how something actually behaves) — not a choice.
+**"What did we do in this repo recently?"**
 
 ```
-record_learning({ repo, branch, learning, context, files? })
+recall({ repo: "owner/name" })
+list_sessions({ repo: "owner/name", limit: 10 })
+read_turns({ session: "<id>" })
 ```
 
-### Revise or drop
+**"Only what Codex did on `feat` last week"**
 
-- `update_decision` / `update_learning` — fix by id (from `recall`); re-embeds for search.
-- `remove_decision` / `remove_learning` — drop wrong or duplicate ids.
+```
+list_sessions({ host: "codex", branch: "feat", time: "last week" })
+grep_turns({ query: "auth", host: "codex", branch: "feat", time: "last week" })
+```
+
+**"What did we say about moving auth to the edge?"**
+
+```
+search({ query: "move auth to the edge" })
+// if thin:
+grep_turns({ query: "auth edge" })
+read_turns({ session: "<id from hits>" })
+```
+
+**"Last time we touched GameRepository on main?"**
+
+```
+recall({ file: "GameRepository", branch: "main" })
+read_turns({ session: "<id>", branch: "main" })
+```
+
+**"Anything about auth from last week / a week ago / the last 7 days?"**
+
+```
+search({ query: "auth", time: "last week" })
+search({ query: "auth", time: "a week ago" })
+grep_turns({ query: "auth edge", time: "last 7 days" })
+```
+
+**Thin or empty results** — broaden in order: `refresh_index` if work was recent → drop/loosen `time` or `host` → try `grep_turns` if you used `search` → shorter keyword or file stem → say you found nothing.
+
+## Record for later search
+
+Lookup works without this. Recording makes semantic search sharper when something durable was settled. Prefer a clear, useful entry over volume — one good decision beats several vague ones.
+
+**`record_decision`** — choice + rationale (why, alternatives rejected), not the diff.  
+Pass `session` (and `host` when known) so the note links back to the conversation.  
+Typical moments: commit, PR open/update, root cause, approach choice, user correction.
+
+**`record_learning`** — non-obvious system fact (gotcha, constraint), not a choice. Same `session` / `host` guidance.
+
+Use `update_*` / `remove_*` with ids from `recall` to fix or drop bad entries.
+
+### Mine a session for decisions (optional)
+
+After a long session (or when the user asks to capture history):
+
+1. `read_turns({ session })` (or branch slice).
+2. Extract settled choices and non-obvious facts.
+3. `record_decision` / `record_learning` with that `session`, plus `repo` / `branch` / `host`.
+
+### Examples
+
+**After choosing approach A over B and committing**
+
+```
+record_decision({
+  repo: "owner/name",
+  branch: "feature/auth",
+  session: "<current session id>",
+  host: "claude",
+  decision: "Terminate sessions at the edge, not in the app server",
+  why: "Rejected in-process middleware — multi-region sticky sessions were already a problem",
+  files: ["src/auth/edge.ts"]
+})
+```
+
+**After discovering a subsystem constraint**
+
+```
+record_learning({
+  repo: "owner/name",
+  branch: "feature/auth",
+  session: "<current session id>",
+  learning: "GameRepository.getActive() excludes soft-deleted rows unless includeDeleted is set",
+  context: "Easy to miss when writing admin tools; default matches player-facing queries"
+})
+```
 
 ## Rules
 
-- **Lookup first.** The product is cross-client conversation recovery.
-- Do not invent past conversations or decisions. Empty results are a valid answer.
-- When recording, pass `repo` and `branch` when you know them.
-- Do not announce recording. Invisible background work.
+- Lookup before speculation.
+- Empty results are valid; do not invent past conversations or decisions.
+- Do not announce recording.

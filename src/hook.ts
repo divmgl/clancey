@@ -1,8 +1,15 @@
 import fs from "fs";
 import { repoKey, currentBranch } from "./git.js";
-import { openStore, insertToolEvent } from "./store.js";
+import { openStore, insertToolEvent, normalizeHost, type Host } from "./store.js";
 import { upgradeNotice } from "./upgrade.js";
 import { logError } from "./logger.js";
+
+/** Optional `--host <name>` from the hook command line (wired per coding client at setup). */
+function hostFromArgv(argv: string[] = process.argv): Host | null {
+  const i = argv.indexOf("--host");
+  if (i === -1) return null;
+  return normalizeHost(argv[i + 1]);
+}
 
 function currentVersion(): string {
   const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
@@ -95,8 +102,8 @@ async function readStdin(): Promise<string> {
 
 /**
  * `clancey hook` — invoked by host live-capture hooks (PostToolUse / SessionStart).
- * Silently records file/command tool events. Decision/learning coaching lives in the
- * Clancey skill, not in injected hook text.
+ * Silently records file/command tool events so branch/file → session lookup works.
+ * Agent guidance (lookup + optional recording) lives in the Clancey skill, not here.
  * Must never throw or block: any failure exits 0 silently.
  */
 export async function runHook(): Promise<void> {
@@ -135,12 +142,13 @@ export async function runHook(): Promise<void> {
   const input = payload.tool_input ?? {};
   const ts = new Date().toISOString();
 
+  const host = hostFromArgv();
   const db = openStore();
   try {
     if (FILE_TOOLS.has(tool) && typeof input.file_path === "string") {
-      insertToolEvent(db, { session, repo, branch, cwd, tool, file: input.file_path, command: null, ts });
+      insertToolEvent(db, { session, repo, branch, cwd, tool, file: input.file_path, command: null, ts, host });
     } else if (tool === "Bash" && typeof input.command === "string") {
-      insertToolEvent(db, { session, repo, branch, cwd, tool, file: null, command: input.command, ts });
+      insertToolEvent(db, { session, repo, branch, cwd, tool, file: null, command: input.command, ts, host });
     }
   } catch (err) {
     logError("hook failed", err);
