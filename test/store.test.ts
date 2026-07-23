@@ -13,6 +13,7 @@ import {
   recall,
   search,
   grepTurns,
+  listRecentSessions,
   getNudgeState,
   setNudgeState,
   insertMessage,
@@ -23,6 +24,8 @@ import {
   updateNote,
   deleteNote,
   noteText,
+  isMessagesFtsExternalContent,
+  hasMessagesFtsContentTable,
 } from "../src/store.ts";
 
 let dbPath: string;
@@ -85,7 +88,13 @@ describe("recall", () => {
     assert.deepEqual(new Set(w.sessions), new Set(["s1", "s2"]));
     assert.equal(w.toolEventCount, 2);
     assert.deepEqual(w.decisions, [
-      { id: decisionId, decision: "Split auth module", why: "It was tangled", ts: "2026-01-01T00:00:03Z" },
+      {
+        id: decisionId,
+        decision: "Split auth module",
+        why: "It was tangled",
+        ts: "2026-01-01T00:00:03Z",
+        session: "s1",
+      },
     ]);
     assert.deepEqual(w.learnings, [
       {
@@ -93,6 +102,7 @@ describe("recall", () => {
         learning: "Sessions are cookie-bound",
         context: "The refresh token lives in an httpOnly cookie",
         ts: "2026-01-01T00:00:04Z",
+        session: "s1",
       },
     ]);
   });
@@ -310,6 +320,17 @@ describe("grepTurns", () => {
 
     assert.deepEqual(hits.map((h) => h.session), ["inside"]);
   });
+
+  test("fresh openStore uses external-content FTS without a content shadow table", () => {
+    assert.equal(isMessagesFtsExternalContent(db), true);
+    assert.equal(hasMessagesFtsContentTable(db), false);
+    msg({ session: "s1", ts: "t1", branch: null, text: "contentless keyword uniquezyx" });
+    const hits = grepTurns(db, "uniquezyx");
+    assert.equal(hits.length, 1);
+    assert.match(hits[0].snippet, /«?uniquezyx»?/);
+    // Structural: no full-text shadow table even after inserts.
+    assert.equal(hasMessagesFtsContentTable(db), false);
+  });
 });
 
 describe("pruneOlderThan", () => {
@@ -430,6 +451,127 @@ describe("schema migration", () => {
       for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
     }
   });
+
+  test("migrates contentful messages_fts to external-content on openStore and keeps grep", () => {
+    const p = path.join(os.tmpdir(), `clancey-fts-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = new Database(p);
+    // Pre-contentless schema: contentful FTS with metadata columns + shadow content table.
+    old.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        branch TEXT,
+        role TEXT NOT NULL,
+        agent TEXT,
+        agent_id TEXT,
+        text TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE messages_fts USING fts5(
+        text,
+        session UNINDEXED,
+        ts UNINDEXED,
+        branch UNINDEXED,
+        role UNINDEXED,
+        agent UNINDEXED
+      );
+    `);
+    old
+      .prepare(
+        `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text)
+         VALUES ('s-old', '2026-01-01T00:00:00.000Z', 'main', 'assistant', NULL, NULL, 'migrate me contentful cohortxyz')`,
+      )
+      .run();
+    old
+      .prepare(
+        `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
+         VALUES (1, 'migrate me contentful cohortxyz', 's-old', '2026-01-01T00:00:00.000Z', 'main', 'assistant', NULL)`,
+      )
+      .run();
+    // Prove the fixture is contentful before migration.
+    const hadContent = old
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE name = 'messages_fts_content'`)
+      .get();
+    assert.ok(hadContent, "fixture must be contentful FTS with shadow table");
+    old.close();
+
+    const migrated = openStore(p);
+    try {
+      assert.equal(isMessagesFtsExternalContent(migrated), true);
+      assert.equal(hasMessagesFtsContentTable(migrated), false);
+      const hits = grepTurns(migrated, "cohortxyz");
+      assert.equal(hits.length, 1);
+      assert.equal(hits[0].session, "s-old");
+      assert.match(hits[0].snippet, /cohortxyz/);
+
+      // Second open is idempotent — still external, grep still works.
+      migrated.close();
+      const again = openStore(p);
+      try {
+        assert.equal(isMessagesFtsExternalContent(again), true);
+        assert.equal(hasMessagesFtsContentTable(again), false);
+        assert.deepEqual(
+          grepTurns(again, "cohortxyz").map((h) => h.session),
+          ["s-old"],
+        );
+        // Write paths stay consistent after migration.
+        insertMessage(again, {
+          session: "s-new",
+          ts: "2026-02-01T00:00:00.000Z",
+          branch: "main",
+          role: "user",
+          agent: null,
+          agentId: null,
+          text: "post-migration insert plughword",
+        });
+        assert.equal(grepTurns(again, "plughword").length, 1);
+        deleteSession(again, "s-old");
+        assert.deepEqual(grepTurns(again, "cohortxyz"), []);
+        assert.equal(grepTurns(again, "plughword").length, 1);
+      } finally {
+        again.close();
+      }
+    } finally {
+      for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
+    }
+  });
+
+  test("prune after contentless migration drops FTS hits for removed text", () => {
+    const p = path.join(os.tmpdir(), `clancey-fts-prune-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = new Database(p);
+    old.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL,
+        branch TEXT, role TEXT NOT NULL, agent TEXT, agent_id TEXT, text TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE messages_fts USING fts5(text, session UNINDEXED, ts UNINDEXED, branch UNINDEXED, role UNINDEXED, agent UNINDEXED);
+    `);
+    old
+      .prepare(
+        `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text) VALUES
+         ('s1', '2020-01-01T00:00:00.000Z', NULL, 'user', NULL, NULL, 'ancient pruneword'),
+         ('s1', datetime('now'), NULL, 'user', NULL, NULL, 'fresh pruneword')`,
+      )
+      .run();
+    old.exec(
+      `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
+       SELECT id, text, session, ts, branch, role, agent FROM messages`,
+    );
+    old.close();
+
+    const migrated = openStore(p);
+    try {
+      assert.equal(hasMessagesFtsContentTable(migrated), false);
+      assert.equal(pruneOlderThan(migrated, 30), 1);
+      const hits = grepTurns(migrated, "pruneword");
+      assert.equal(hits.length, 1);
+      assert.match(hits[0].snippet, /fresh/);
+      assert.doesNotMatch(hits[0].snippet, /ancient/);
+    } finally {
+      migrated.close();
+      for (const ext of ["", "-wal", "-shm"]) fs.rmSync(p + ext, { force: true });
+    }
+  });
 });
 
 describe("note editing", () => {
@@ -454,12 +596,30 @@ describe("note editing", () => {
 
   test("insertNote returns an id that getNote resolves with its kind", () => {
     const id = record("decision", "D", "W", true);
-    assert.deepEqual(getNote(db, id), { id, kind: "decision", body: "D", detail: "W", repo: "/r", branch: "b" });
+    assert.deepEqual(getNote(db, id), {
+      id,
+      kind: "decision",
+      body: "D",
+      detail: "W",
+      repo: "/r",
+      branch: "b",
+      session: null,
+      host: null,
+    });
   });
 
   test("getNote reports the learning kind", () => {
     const id = record("learning", "L", "C", true);
-    assert.deepEqual(getNote(db, id), { id, kind: "learning", body: "L", detail: "C", repo: "/r", branch: "b" });
+    assert.deepEqual(getNote(db, id), {
+      id,
+      kind: "learning",
+      body: "L",
+      detail: "C",
+      repo: "/r",
+      branch: "b",
+      session: null,
+      host: null,
+    });
   });
 
   test("updateNote rewrites the event and replaces the linked embedding", () => {
@@ -491,5 +651,174 @@ describe("note editing", () => {
   test("returns false for a missing id", () => {
     assert.equal(deleteNote(db, 999), false);
     assert.equal(updateNote(db, 999, { body: "x", detail: null }, [0, 1]), false);
+  });
+});
+
+describe("lookup filters and sessions", () => {
+  test("search and grep_turns scope by repo, branch, and host", () => {
+    insertMessage(db, {
+      session: "claude-1",
+      ts: "2026-02-01T00:00:00Z",
+      branch: "main",
+      role: "user",
+      agent: null,
+      agentId: null,
+      text: "alpha keyword uniqueA",
+      host: "claude",
+      repo: "/repo-a",
+    });
+    insertMessage(db, {
+      session: "codex-1",
+      ts: "2026-02-02T00:00:00Z",
+      branch: "feat",
+      role: "assistant",
+      agent: "Plan",
+      agentId: "p1",
+      text: "alpha keyword uniqueB",
+      host: "codex",
+      repo: "/repo-b",
+    });
+    insertEmbedding(db, {
+      session: "claude-1",
+      repo: "/repo-a",
+      branch: "main",
+      kind: "framing",
+      text: "alpha framing a",
+      vector: [1, 0, 0],
+      ts: "2026-02-01T00:00:00Z",
+      host: "claude",
+    });
+    insertEmbedding(db, {
+      session: "codex-1",
+      repo: "/repo-b",
+      branch: "feat",
+      kind: "framing",
+      text: "alpha framing b",
+      vector: [0.9, 0.1, 0],
+      ts: "2026-02-02T00:00:00Z",
+      host: "codex",
+    });
+
+    const grepped = grepTurns(db, "alpha keyword", { repo: "/repo-a", host: "claude" });
+    assert.equal(grepped.length, 1);
+    assert.equal(grepped[0].session, "claude-1");
+    assert.equal(grepped[0].host, "claude");
+    assert.equal(grepped[0].agent, null);
+
+    const greppedAgent = grepTurns(db, "uniqueB", { host: "codex" });
+    assert.equal(greppedAgent.length, 1);
+    assert.equal(greppedAgent[0].agent, "Plan");
+
+    const hits = search(db, [1, 0, 0], { repo: "/repo-a", host: "claude" });
+    assert.ok(hits.length >= 1);
+    assert.ok(hits.every((h) => h.repo === "/repo-a" && h.host === "claude"));
+
+    const byBranch = search(db, [1, 0, 0], { branch: "feat" });
+    assert.ok(byBranch.every((h) => h.branch === "feat"));
+  });
+
+  test("listRecentSessions orders by activity and filters repo/host/time", () => {
+    insertMessage(db, {
+      session: "old",
+      ts: "2026-01-01T00:00:00Z",
+      branch: "main",
+      role: "user",
+      agent: null,
+      agentId: null,
+      text: "old chat",
+      host: "claude",
+      repo: "/r1",
+    });
+    insertToolEvent(db, {
+      session: "new",
+      repo: "/r1",
+      branch: "feat",
+      cwd: "/r1",
+      tool: "Edit",
+      file: "/r1/a.ts",
+      command: null,
+      ts: "2026-03-01T00:00:00Z",
+      host: "codex",
+    });
+    insertMessage(db, {
+      session: "other",
+      ts: "2026-04-01T00:00:00Z",
+      branch: "main",
+      role: "user",
+      agent: null,
+      agentId: null,
+      text: "other repo",
+      host: "opencode",
+      repo: "/r2",
+    });
+
+    const all = listRecentSessions(db, { limit: 10 });
+    assert.equal(all[0].session, "other");
+    assert.equal(all[1].session, "new");
+    assert.equal(all[2].session, "old");
+
+    const r1 = listRecentSessions(db, { repo: "/r1" });
+    assert.deepEqual(
+      r1.map((s) => s.session),
+      ["new", "old"],
+    );
+
+    const codexOnly = listRecentSessions(db, { host: "codex" });
+    assert.equal(codexOnly.length, 1);
+    assert.equal(codexOnly[0].session, "new");
+    assert.equal(codexOnly[0].host, "codex");
+
+    const windowed = listRecentSessions(db, {
+      since: "2026-02-01T00:00:00Z",
+      until: "2026-03-15T00:00:00Z",
+    });
+    assert.equal(windowed.length, 1);
+    assert.equal(windowed[0].session, "new");
+  });
+
+  test("record decision/learning keeps session id and surfaces on recall/search", () => {
+    insertToolEvent(db, {
+      session: "ses-1",
+      repo: "/r",
+      branch: "b",
+      cwd: "/r",
+      tool: "Edit",
+      file: "/r/f.ts",
+      command: null,
+      ts: "2026-01-01T00:00:00Z",
+      host: "claude",
+    });
+    const id = insertNote(db, {
+      kind: "decision",
+      session: "ses-1",
+      repo: "/r",
+      branch: "b",
+      body: "Use edge auth",
+      detail: "multi-region",
+      files: null,
+      ts: "2026-01-01T00:00:01Z",
+      host: "claude",
+    });
+    insertEmbedding(db, {
+      session: "ses-1",
+      repo: "/r",
+      branch: "b",
+      kind: "decision",
+      text: noteText("Use edge auth", "multi-region"),
+      vector: [0, 1, 0],
+      ts: "2026-01-01T00:00:01Z",
+      eventId: id,
+      host: "claude",
+    });
+
+    const note = getNote(db, id);
+    assert.equal(note?.session, "ses-1");
+    assert.equal(note?.host, "claude");
+
+    const items = recall(db, { branch: "b" });
+    assert.equal(items[0].decisions[0].session, "ses-1");
+
+    const hits = search(db, [0, 1, 0], { host: "claude" });
+    assert.ok(hits.some((h) => h.session === "ses-1" && h.kind === "decision"));
   });
 });

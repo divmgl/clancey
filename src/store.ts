@@ -9,6 +9,17 @@ export const DB_PATH = path.join(CLANCEY_DIR, "clancey.db");
 
 export type Store = Database.Database;
 
+/** Coding host that produced a session/event. Unknown for pre-tag rows. */
+export type Host = "claude" | "codex" | "opencode" | "grok" | "hermes" | "unknown";
+
+export const HOSTS: readonly Host[] = ["claude", "codex", "opencode", "grok", "hermes", "unknown"] as const;
+
+export function normalizeHost(raw: string | null | undefined): Host | null {
+  if (raw == null || raw === "") return null;
+  const h = raw.toLowerCase();
+  return (HOSTS as readonly string[]).includes(h) ? (h as Host) : null;
+}
+
 export interface ToolEventInput {
   session: string;
   repo: string | null;
@@ -20,6 +31,8 @@ export interface ToolEventInput {
   ts: string;
   /** Subagent type when this event came from a subagent transcript; null for the main session. */
   agent?: string | null;
+  /** Coding host (claude/codex/opencode/grok/hermes). */
+  host?: Host | null;
 }
 
 /** The two kinds of note an agent records by hand: a decision, or an incidental learning. */
@@ -34,6 +47,7 @@ export interface NoteInput {
   detail: string | null; // the "why" of a decision, or the context of a learning
   files: string[] | null;
   ts: string;
+  host?: Host | null;
 }
 
 export interface EmbeddingInput {
@@ -45,6 +59,7 @@ export interface EmbeddingInput {
   vector: number[];
   ts: string;
   eventId?: number | null;
+  host?: Host | null;
 }
 
 export interface StoredNote {
@@ -54,6 +69,8 @@ export interface StoredNote {
   detail: string | null;
   repo: string | null;
   branch: string | null;
+  session: string | null;
+  host: Host | null;
 }
 
 export interface MessageInput {
@@ -64,6 +81,8 @@ export interface MessageInput {
   agent: string | null;
   agentId: string | null;
   text: string;
+  host?: Host | null;
+  repo?: string | null;
 }
 
 export interface StoredMessage {
@@ -79,11 +98,12 @@ export interface WorkItem {
   branch: string | null;
   sessions: string[];
   files: string[];
-  decisions: { id: number; decision: string; why: string | null; ts: string }[];
-  learnings: { id: number; learning: string; context: string | null; ts: string }[];
+  decisions: { id: number; decision: string; why: string | null; ts: string; session: string | null }[];
+  learnings: { id: number; learning: string; context: string | null; ts: string; session: string | null }[];
   firstTs: string;
   lastTs: string;
   toolEventCount: number;
+  hosts: Host[];
 }
 
 export interface SearchHit {
@@ -93,6 +113,7 @@ export interface SearchHit {
   kind: string;
   text: string;
   score: number;
+  host: Host | null;
 }
 
 export interface TimeFilter {
@@ -102,6 +123,18 @@ export interface TimeFilter {
 
 export interface SearchOptions extends TimeFilter {
   limit?: number;
+  repo?: string;
+  branch?: string;
+  host?: string;
+}
+
+export interface SessionSummary {
+  session: string;
+  host: Host | null;
+  repo: string | null;
+  branch: string | null;
+  firstTs: string;
+  lastTs: string;
 }
 
 export function openStore(dbPath: string = DB_PATH): Store {
@@ -165,15 +198,12 @@ function migrate(db: Store): void {
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session);
     CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 
-    -- Keyword index over the full conversation. Metadata columns are UNINDEXED so they ride
-    -- along with results (role/agent attribution, snippet reconstruction) without being matched.
+    -- Keyword index over conversation text. External-content FTS5: inverted index only;
+    -- document bodies live solely in messages (no messages_fts_content shadow copy).
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       text,
-      session  UNINDEXED,
-      ts       UNINDEXED,
-      branch   UNINDEXED,
-      role     UNINDEXED,
-      agent    UNINDEXED
+      content='messages',
+      content_rowid='id'
     );
 
     CREATE TABLE IF NOT EXISTS state (
@@ -196,23 +226,80 @@ function migrate(db: Store): void {
   addColumnIfMissing(db, "embeddings", "event_id", "INTEGER");
   addColumnIfMissing(db, "state", "last_event_ts", "TEXT");
   addColumnIfMissing(db, "events", "agent", "TEXT");
-  backfillMessagesFts(db);
+  addColumnIfMissing(db, "events", "host", "TEXT");
+  addColumnIfMissing(db, "embeddings", "host", "TEXT");
+  addColumnIfMissing(db, "messages", "host", "TEXT");
+  addColumnIfMissing(db, "messages", "repo", "TEXT");
+  ensureMessagesFts(db);
   // The legacy human-only `turns` snapshot is superseded by `messages` (which stores user turns
   // too). Drop it so we don't keep a second copy of every human turn; `backfill --force`
   // repopulates `messages` from the transcripts.
   db.exec(`DROP TABLE IF EXISTS turns_fts; DROP TABLE IF EXISTS turns;`);
 }
 
-/** Populate messages_fts from messages when the FTS table is new but messages already has rows. */
+/** DDL for the external-content messages FTS index (no plaintext shadow table). */
+export const MESSAGES_FTS_DDL = `CREATE VIRTUAL TABLE messages_fts USING fts5(
+  text,
+  content='messages',
+  content_rowid='id'
+)`;
+
+/** True when messages_fts is external-content (or contentless) and not the old contentful shape. */
+export function isMessagesFtsExternalContent(db: Store): boolean {
+  const sql = messagesFtsSql(db);
+  if (!sql) return false;
+  // External content: content='messages'. Contentless: content=''.
+  // Old contentful FTS has neither and materializes messages_fts_content.
+  if (/content\s*=\s*'messages'/i.test(sql) || /content\s*=\s*''/i.test(sql)) return true;
+  return false;
+}
+
+/** True when the legacy contentful shadow table is present. */
+export function hasMessagesFtsContentTable(db: Store): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_content'`,
+    )
+    .get() as { ok: number } | undefined;
+  return row !== undefined;
+}
+
+function messagesFtsSql(db: Store): string | null {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE name = 'messages_fts' AND sql IS NOT NULL`)
+    .get() as { sql: string } | undefined;
+  return row?.sql ?? null;
+}
+
+/**
+ * Ensure messages_fts is external-content FTS5. Rebuilds once from messages when the DB still
+ * has the old contentful shape (or is missing FTS). Subsequent opens are a no-op aside from a
+ * cheap empty-index backfill check.
+ */
+function ensureMessagesFts(db: Store): void {
+  const sql = messagesFtsSql(db);
+  const needsRebuild = !sql || !isMessagesFtsExternalContent(db) || hasMessagesFtsContentTable(db);
+
+  if (needsRebuild) {
+    db.exec(`DROP TABLE IF EXISTS messages_fts`);
+    db.exec(MESSAGES_FTS_DDL);
+    db.exec(`INSERT INTO messages_fts (rowid, text) SELECT id, text FROM messages`);
+    return;
+  }
+
+  backfillMessagesFts(db);
+}
+
+/** Populate messages_fts from messages when the FTS index is empty but messages already has rows. */
 function backfillMessagesFts(db: Store): void {
-  const fts = (db.prepare(`SELECT count(*) c FROM messages_fts`).get() as { c: number }).c;
-  if (fts > 0) return;
+  // External-content FTS: `SELECT count(*) FROM messages_fts` reads the content table
+  // (messages), not the index — so an unbuilt index still reports messages.length.
+  // docsize tracks indexed documents and is 0 until we INSERT into the FTS index.
+  const indexed = (db.prepare(`SELECT count(*) c FROM messages_fts_docsize`).get() as { c: number }).c;
+  if (indexed > 0) return;
   const msgs = (db.prepare(`SELECT count(*) c FROM messages`).get() as { c: number }).c;
   if (msgs === 0) return;
-  db.exec(
-    `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
-     SELECT id, text, session, ts, branch, role, agent FROM messages`,
-  );
+  db.exec(`INSERT INTO messages_fts (rowid, text) SELECT id, text FROM messages`);
 }
 
 /** Additive schema upgrade for dbs created before a column existed. */
@@ -237,17 +324,17 @@ export function setMeta(db: Store, key: string, value: string): void {
 
 export function insertToolEvent(db: Store, e: ToolEventInput): void {
   db.prepare(
-    `INSERT INTO events (ts, type, session, repo, branch, cwd, tool, file, command, agent)
-     VALUES (@ts, 'tool', @session, @repo, @branch, @cwd, @tool, @file, @command, @agent)`,
-  ).run({ ...e, agent: e.agent ?? null });
+    `INSERT INTO events (ts, type, session, repo, branch, cwd, tool, file, command, agent, host)
+     VALUES (@ts, 'tool', @session, @repo, @branch, @cwd, @tool, @file, @command, @agent, @host)`,
+  ).run({ ...e, agent: e.agent ?? null, host: e.host ?? null });
 }
 
 /** Insert a note (decision or learning) and return its id, so its embedding can link back to it. */
 export function insertNote(db: Store, n: NoteInput): number {
   const info = db
     .prepare(
-      `INSERT INTO events (ts, type, session, repo, branch, decision, why, files_json)
-       VALUES (@ts, @kind, @session, @repo, @branch, @body, @detail, @files_json)`,
+      `INSERT INTO events (ts, type, session, repo, branch, decision, why, files_json, host)
+       VALUES (@ts, @kind, @session, @repo, @branch, @body, @detail, @files_json, @host)`,
     )
     .run({
       ts: n.ts,
@@ -258,15 +345,16 @@ export function insertNote(db: Store, n: NoteInput): number {
       body: n.body,
       detail: n.detail,
       files_json: n.files ? JSON.stringify(n.files) : null,
+      host: n.host ?? null,
     });
   return Number(info.lastInsertRowid);
 }
 
 export function insertEmbedding(db: Store, e: EmbeddingInput): void {
   db.prepare(
-    `INSERT INTO embeddings (ts, session, repo, branch, kind, text, vector, event_id)
-     VALUES (@ts, @session, @repo, @branch, @kind, @text, @vector, @event_id)`,
-  ).run({ ...e, vector: vectorToBlob(e.vector), event_id: e.eventId ?? null });
+    `INSERT INTO embeddings (ts, session, repo, branch, kind, text, vector, event_id, host)
+     VALUES (@ts, @session, @repo, @branch, @kind, @text, @vector, @event_id, @host)`,
+  ).run({ ...e, vector: vectorToBlob(e.vector), event_id: e.eventId ?? null, host: e.host ?? null });
 }
 
 /** The text stored on a note's embedding row (the search-visible summary). */
@@ -281,11 +369,33 @@ export function noteEmbedInput(body: string, detail: string | null): string {
 
 export function getNote(db: Store, id: number): StoredNote | undefined {
   const row = db
-    .prepare(`SELECT id, type, decision, why, repo, branch FROM events WHERE id = ? AND type IN ('decision', 'learning')`)
+    .prepare(
+      `SELECT id, type, decision, why, repo, branch, session, host FROM events WHERE id = ? AND type IN ('decision', 'learning')`,
+    )
     .get(id) as
-    | { id: number; type: NoteKind; decision: string; why: string | null; repo: string | null; branch: string | null }
+    | {
+        id: number;
+        type: NoteKind;
+        decision: string;
+        why: string | null;
+        repo: string | null;
+        branch: string | null;
+        session: string | null;
+        host: string | null;
+      }
     | undefined;
-  return row ? { id: row.id, kind: row.type, body: row.decision, detail: row.why, repo: row.repo, branch: row.branch } : undefined;
+  return row
+    ? {
+        id: row.id,
+        kind: row.type,
+        body: row.decision,
+        detail: row.why,
+        repo: row.repo,
+        branch: row.branch,
+        session: row.session,
+        host: normalizeHost(row.host),
+      }
+    : undefined;
 }
 
 /**
@@ -317,7 +427,7 @@ export function updateNote(
     detail: next.detail,
   });
   insertEmbedding(db, {
-    session: "",
+    session: existing.session ?? "",
     repo: existing.repo,
     branch: existing.branch,
     kind: existing.kind,
@@ -325,6 +435,7 @@ export function updateNote(
     vector,
     ts: new Date().toISOString(),
     eventId: id,
+    host: existing.host,
   });
   return true;
 }
@@ -342,14 +453,14 @@ export function deleteNote(db: Store, id: number): boolean {
 export function insertMessage(db: Store, m: MessageInput): void {
   const info = db
     .prepare(
-      `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text)
-       VALUES (@session, @ts, @branch, @role, @agent, @agentId, @text)`,
+      `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text, host, repo)
+       VALUES (@session, @ts, @branch, @role, @agent, @agentId, @text, @host, @repo)`,
     )
-    .run(m);
-  db.prepare(
-    `INSERT INTO messages_fts (rowid, text, session, ts, branch, role, agent)
-     VALUES (@rowid, @text, @session, @ts, @branch, @role, @agent)`,
-  ).run({ rowid: Number(info.lastInsertRowid), text: m.text, session: m.session, ts: m.ts, branch: m.branch, role: m.role, agent: m.agent });
+    .run({ ...m, host: m.host ?? null, repo: m.repo ?? null });
+  db.prepare(`INSERT INTO messages_fts (rowid, text) VALUES (@rowid, @text)`).run({
+    rowid: Number(info.lastInsertRowid),
+    text: m.text,
+  });
 }
 
 export function getMessages(db: Store, session: string, branch?: string): StoredMessage[] {
@@ -369,6 +480,7 @@ interface EventRow {
   file: string | null;
   decision: string | null;
   why: string | null;
+  host: string | null;
 }
 
 /** `col = @p` for a value, `col IS NULL` for null — sqlite `=` never matches NULL. */
@@ -378,7 +490,15 @@ function eqOrNull(col: string, value: string | null, param: string): string {
 
 export function recall(
   db: Store,
-  opts: { repo?: string; branch?: string; file?: string; since?: string; until?: string; limit?: number } = {},
+  opts: {
+    repo?: string;
+    branch?: string;
+    file?: string;
+    host?: string;
+    since?: string;
+    until?: string;
+    limit?: number;
+  } = {},
 ): WorkItem[] {
   const where: string[] = [];
   const params: Record<string, string> = {};
@@ -393,6 +513,11 @@ export function recall(
   if (opts.file) {
     where.push("file LIKE @file");
     params.file = `%${opts.file}%`;
+  }
+  const host = normalizeHost(opts.host);
+  if (host) {
+    where.push("host = @host");
+    params.host = host;
   }
   if (opts.since) {
     where.push("ts >= @since");
@@ -417,26 +542,30 @@ export function recall(
       .prepare(
         `SELECT * FROM events
          WHERE ${eqOrNull("repo", repo, "repo")} AND ${eqOrNull("branch", branch, "branch")}
+         ${host ? "AND host = @host" : ""}
          ${opts.since ? "AND ts >= @since" : ""}
          ${opts.until ? "AND ts < @until" : ""}
          ORDER BY ts`,
       )
-      .all({ repo, branch, since: opts.since, until: opts.until }) as EventRow[];
+      .all({ repo, branch, host, since: opts.since, until: opts.until }) as EventRow[];
 
     const sessions = new Set<string>();
     const files = new Set<string>();
+    const hosts = new Set<Host>();
     const decisions: WorkItem["decisions"] = [];
     const learnings: WorkItem["learnings"] = [];
     let toolEventCount = 0;
     for (const r of rows) {
       if (r.session) sessions.add(r.session);
+      const h = normalizeHost(r.host);
+      if (h) hosts.add(h);
       if (r.type === "tool") {
         toolEventCount++;
         if (r.file) files.add(r.file);
       } else if (r.type === "decision" && r.decision) {
-        decisions.push({ id: r.id, decision: r.decision, why: r.why, ts: r.ts });
+        decisions.push({ id: r.id, decision: r.decision, why: r.why, ts: r.ts, session: r.session });
       } else if (r.type === "learning" && r.decision) {
-        learnings.push({ id: r.id, learning: r.decision, context: r.why, ts: r.ts });
+        learnings.push({ id: r.id, learning: r.decision, context: r.why, ts: r.ts, session: r.session });
       }
     }
     return {
@@ -449,6 +578,7 @@ export function recall(
       firstTs: rows[0]?.ts ?? "",
       lastTs: rows[rows.length - 1]?.ts ?? "",
       toolEventCount,
+      hosts: [...hosts],
     };
   });
 }
@@ -460,6 +590,8 @@ export interface TurnHit {
   role: string;
   agent: string | null;
   snippet: string;
+  host: Host | null;
+  repo: string | null;
 }
 
 /**
@@ -484,15 +616,33 @@ function searchOptions(opts: number | SearchOptions): SearchOptions {
   return typeof opts === "number" ? { limit: opts } : opts;
 }
 
-function timeWhere(opts: TimeFilter, params: Record<string, string | number>): string {
+function scopeWhere(
+  alias: string,
+  opts: SearchOptions,
+  params: Record<string, string | number>,
+): string {
   const where: string[] = [];
+  const col = (name: string) => (alias ? `${alias}.${name}` : name);
   if (opts.since) {
-    where.push("ts >= @since");
+    where.push(`${col("ts")} >= @since`);
     params.since = opts.since;
   }
   if (opts.until) {
-    where.push("ts < @until");
+    where.push(`${col("ts")} < @until`);
     params.until = opts.until;
+  }
+  if (opts.repo) {
+    where.push(`${col("repo")} = @repo`);
+    params.repo = opts.repo;
+  }
+  if (opts.branch) {
+    where.push(`${col("branch")} = @branch`);
+    params.branch = opts.branch;
+  }
+  const host = normalizeHost(opts.host);
+  if (host) {
+    where.push(`${col("host")} = @host`);
+    params.host = host;
   }
   return where.length ? ` AND ${where.join(" AND ")}` : "";
 }
@@ -502,15 +652,42 @@ export function grepTurns(db: Store, query: string, opts: number | SearchOptions
   if (!match) return [];
   const options = searchOptions(opts);
   const params: Record<string, string | number> = { match, limit: options.limit ?? 8 };
-  const time = timeWhere(options, params);
-  return db
+  // Scope columns live on the joined `messages` row (alias m).
+  // Keep messages_fts unaliased so MATCH/snippet/rank bind correctly under better-sqlite3.
+  const scope = scopeWhere("m", options, params);
+  // Prefer columns from `messages` (content table). FTS5 joined tables reject
+  // messages_fts.col qualification in SELECT under better-sqlite3.
+  const rows = db
     .prepare(
-      `SELECT session, branch, ts, role, agent, snippet(messages_fts, 0, '«', '»', '…', 16) AS snippet
-       FROM messages_fts WHERE messages_fts MATCH @match
-       ${time}
+      `SELECT m.session AS session, m.branch AS branch, m.ts AS ts, m.role AS role, m.agent AS agent,
+              snippet(messages_fts, 0, '«', '»', '…', 16) AS snippet,
+              m.host AS host, m.repo AS repo
+       FROM messages_fts
+       JOIN messages m ON m.id = messages_fts.rowid
+       WHERE messages_fts MATCH @match
+       ${scope}
        ORDER BY rank LIMIT @limit`,
     )
-    .all(params) as TurnHit[];
+    .all(params) as {
+    session: string;
+    branch: string | null;
+    ts: string;
+    role: string;
+    agent: string | null;
+    snippet: string;
+    host: string | null;
+    repo: string | null;
+  }[];
+  return rows.map((r) => ({
+    session: r.session,
+    branch: r.branch,
+    ts: r.ts,
+    role: r.role,
+    agent: r.agent,
+    snippet: r.snippet,
+    host: normalizeHost(r.host),
+    repo: r.repo,
+  }));
 }
 
 export function search(db: Store, queryVector: number[], opts: number | SearchOptions = 8): SearchHit[] {
@@ -525,9 +702,22 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
     where.push("ts < @until");
     params.until = options.until;
   }
+  if (options.repo) {
+    where.push("repo = @repo");
+    params.repo = options.repo;
+  }
+  if (options.branch) {
+    where.push("branch = @branch");
+    params.branch = options.branch;
+  }
+  const host = normalizeHost(options.host);
+  if (host) {
+    where.push("host = @host");
+    params.host = host;
+  }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const rows = db
-    .prepare(`SELECT session, repo, branch, kind, text, vector FROM embeddings ${clause}`)
+    .prepare(`SELECT session, repo, branch, kind, text, vector, host FROM embeddings ${clause}`)
     .all(params) as {
     session: string;
     repo: string | null;
@@ -535,6 +725,7 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
     kind: string;
     text: string;
     vector: Buffer;
+    host: string | null;
   }[];
 
   return rows
@@ -545,9 +736,79 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
       kind: r.kind,
       text: r.text,
       score: cosineSimilarity(queryVector, blobToVector(r.vector)),
+      host: normalizeHost(r.host),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, options.limit ?? 8);
+}
+
+/**
+ * Recent sessions by last activity (messages + tool events), optionally scoped by repo/host/time.
+ */
+export function listRecentSessions(
+  db: Store,
+  opts: SearchOptions = {},
+): SessionSummary[] {
+  const params: Record<string, string | number> = { limit: opts.limit ?? 20 };
+  const filters: string[] = ["session IS NOT NULL", "session <> ''"];
+  if (opts.since) {
+    filters.push("ts >= @since");
+    params.since = opts.since;
+  }
+  if (opts.until) {
+    filters.push("ts < @until");
+    params.until = opts.until;
+  }
+  if (opts.repo) {
+    filters.push("repo = @repo");
+    params.repo = opts.repo;
+  }
+  if (opts.branch) {
+    filters.push("branch = @branch");
+    params.branch = opts.branch;
+  }
+  const host = normalizeHost(opts.host);
+  if (host) {
+    filters.push("host = @host");
+    params.host = host;
+  }
+  const where = `WHERE ${filters.join(" AND ")}`;
+  const rows = db
+    .prepare(
+      `SELECT session,
+              MAX(ts) AS lastTs,
+              MIN(ts) AS firstTs,
+              MAX(host) AS host,
+              MAX(repo) AS repo,
+              MAX(branch) AS branch
+       FROM (
+         SELECT session, ts, host, repo, branch FROM messages
+         UNION ALL
+         SELECT session, ts, host, repo, branch FROM events
+           WHERE type = 'tool' OR type IN ('decision', 'learning')
+       )
+       ${where}
+       GROUP BY session
+       ORDER BY lastTs DESC
+       LIMIT @limit`,
+    )
+    .all(params) as {
+    session: string;
+    lastTs: string;
+    firstTs: string;
+    host: string | null;
+    repo: string | null;
+    branch: string | null;
+  }[];
+
+  return rows.map((r) => ({
+    session: r.session,
+    host: normalizeHost(r.host),
+    repo: r.repo,
+    branch: r.branch,
+    firstTs: r.firstTs,
+    lastTs: r.lastTs,
+  }));
 }
 
 export interface NudgeState {
@@ -610,8 +871,11 @@ export function setIngested(db: Store, filePath: string, mtimeMs: number): void 
 export function deleteSession(db: Store, session: string): void {
   db.prepare(`DELETE FROM events WHERE session = ? AND type = 'tool'`).run(session);
   db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
+  // Drop FTS rows by messages.id before deleting messages (external-content index).
+  db.prepare(
+    `DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE session = ?)`,
+  ).run(session);
   db.prepare(`DELETE FROM messages WHERE session = ?`).run(session);
-  db.prepare(`DELETE FROM messages_fts WHERE session = ?`).run(session);
 }
 
 /**
