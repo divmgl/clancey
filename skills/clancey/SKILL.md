@@ -21,12 +21,12 @@ When the user asks about past work, **retrieve the conversation**. Do not invent
 
 | Need | Tool | Notes |
 |------|------|--------|
-| Branch, file, PR, or repo → sessions | `recall` | Deterministic map to sessions, files, hosts, and stored decisions/learnings. Start here when you have a concrete anchor. |
+| Branch, file, PR, or repo → sessions | `recall` | Deterministic map to sessions, files, hosts, and stored decisions/learnings. Start here when you have a concrete anchor. Paged like `read_turns` — continue with the `offset` in the response header. |
 | Recent sessions (browse) | `list_sessions` | By last activity; filter by repo/branch/host/time. Then `read_turns`. |
 | Topic without a branch | `search` | Meaning **and** wording together (framings, decisions/learnings, and full turn text, fused). Scope with repo/branch/host/time. |
 | Exact words / offhand remarks | `grep_turns` | Keyword search over the full verbatim transcript, **including subagent turns** (speaker `assistant·AgentType`). |
 | Full session text | `read_turns` | Conversation for a session id, **one window at a time**. Optional **branch slice**. Continue with the `offset` in the response header, or jump to a hit with `around: "<ts from grep_turns>"`. If the live transcript was pruned, Clancey serves the **stored snapshot**. |
-| Stale / empty index | `refresh_index` | Re-ingest changed transcripts so recent work is findable. |
+| Stale / empty index | `refresh_index` | Re-ingest changed transcripts so recent work is findable. After an upgrade the index re-reads history in the background, newest first — if a result says it is upgrading, retry shortly rather than reading files. |
 
 Shared scope knobs (where supported): `repo`, `branch`, `host` (`claude` \| `codex` \| `opencode` \| `grok` \| `hermes`), `time` / `since` / `until`, `limit`, `exclude_session` / `exclude_sessions`.
 

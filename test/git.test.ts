@@ -10,6 +10,7 @@ import {
   remoteShortKey,
   repoKey,
   expandRepoFilterKeys,
+  canonicalRepo,
 } from "../src/git.ts";
 
 const tempDirs: string[] = [];
@@ -79,5 +80,25 @@ describe("remoteShortKey + expandRepoFilterKeys", () => {
     const root = repoKey(other)!;
     const keys = expandRepoFilterKeys("fifthdoor/gaia", [root]);
     assert.deepEqual(keys, ["fifthdoor/gaia"]);
+  });
+});
+
+describe("canonicalRepo", () => {
+  test("a short key is never resolved against the process's own checkout", () => {
+    // Regression: the path walk fell through to "." for a relative key, so healing an index from
+    // inside another repo relabelled every session with that repo.
+    assert.equal(canonicalRepo("fifthdoor/gaia"), "fifthdoor/gaia");
+    assert.equal(canonicalRepo("gaia"), "gaia");
+  });
+
+  test("an unrecognized worktree path is matched to a known repo by name", () => {
+    const dir = tempGitRepo("git@github.com:fifthdoor/gaia.git");
+    // A checkout that no longer exists on disk, named after a repo we do know.
+    assert.equal(canonicalRepo("/gone/worktrees/gaia/pr-3", [repoKey(dir)!, "fifthdoor/gaia"]), "fifthdoor/gaia");
+  });
+
+  test("an absolute checkout path resolves to its origin short key", () => {
+    const dir = tempGitRepo("git@github.com:fifthdoor/gaia.git");
+    assert.equal(canonicalRepo(dir), "fifthdoor/gaia");
   });
 });

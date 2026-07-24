@@ -102,7 +102,10 @@ describe("runWatch supervisor", () => {
     let loops = 0;
     const result = await runWatch({
       dir,
-      pollMs: 5,
+      // Ingest every iteration: gating on wall-clock pollMs races the no-op sleep, so whether
+      // the unregister ever fires depends on how fast the loop spins.
+      pollMs: 0,
+      clientCheckMs: 0,
       startGraceMs: 0,
       ingest: async () => {
         loops++;

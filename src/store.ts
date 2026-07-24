@@ -618,7 +618,7 @@ export function listKnownRepos(db: Store): string[] {
  * the next backfill drop its cursors and re-read every transcript, so shape fixes reach existing
  * databases on their own — `--force` is a flag nobody remembers to run.
  */
-export const INGEST_VERSION = 3;
+export const INGEST_VERSION = 4;
 
 export function ingestVersionChanged(db: Store): boolean {
   return getMeta(db, "ingest_version") !== String(INGEST_VERSION);
@@ -634,6 +634,19 @@ export function clearAllIngestCursors(db: Store): void {
 }
 
 /**
+ * Whether a full re-read is still owed. Cleared cursors alone can't say so: to a later backfill
+ * they look identical to a first run, and re-reading every transcript is minutes of work that
+ * must never land inside an MCP tool call. The watcher clears this when a full pass finishes.
+ */
+export function isReingestPending(db: Store): boolean {
+  return getMeta(db, "reingest_pending") === "1";
+}
+
+export function setReingestPending(db: Store, pending: boolean): void {
+  setMeta(db, "reingest_pending", pending ? "1" : "0");
+}
+
+/**
  * Repair repo attribution on rows already in the store, so scoped lookups work immediately
  * instead of waiting out a full re-ingest. Two passes:
  *
@@ -641,11 +654,13 @@ export function clearAllIngestCursors(db: Store): void {
  *    only ever derived from the first tool event, so a session that edited nothing was unscoped).
  * 2. Every distinct repo value through `canonicalize`, collapsing worktrees, subdirectories and
  *    path-vs-`owner/name` spellings of the same repo onto one key.
+ * 3. Notes back onto their own conversation's repo. A note is only ever as good as the session it
+ *    points at, and `messages.repo` comes from the transcript's cwd, so it wins any disagreement.
  */
 export function healRepoAttribution(
   db: Store,
   canonicalize: (repo: string) => string | null,
-): { linked: number; canonicalized: number } {
+): { linked: number; canonicalized: number; renoted: number } {
   const linked = db
     .prepare(
       `UPDATE messages SET repo = (
@@ -671,7 +686,33 @@ export function healRepoAttribution(
         .run({ canonical, stored }).changes;
     }
   }
-  return { linked, canonicalized };
+  const renoted = db
+    .prepare(
+      `UPDATE events SET repo = (
+         SELECT m.repo FROM messages m WHERE m.session = events.session AND m.repo IS NOT NULL LIMIT 1
+       )
+       WHERE type IN ('decision','learning')
+         AND session IS NOT NULL AND session <> ''
+         AND EXISTS (
+           SELECT 1 FROM messages m
+           WHERE m.session = events.session AND m.repo IS NOT NULL AND m.repo IS NOT events.repo
+         )`,
+    )
+    .run().changes;
+
+  // Same rule for the vectors, or a note and the embedding that finds it would answer to
+  // different repo filters.
+  db.prepare(
+    `UPDATE embeddings SET repo = (
+       SELECT m.repo FROM messages m WHERE m.session = embeddings.session AND m.repo IS NOT NULL LIMIT 1
+     )
+     WHERE EXISTS (
+       SELECT 1 FROM messages m
+       WHERE m.session = embeddings.session AND m.repo IS NOT NULL AND m.repo IS NOT embeddings.repo
+     )`,
+  ).run();
+
+  return { linked, canonicalized, renoted };
 }
 
 /** How far a note's timestamp may sit from a session's activity and still belong to it. */

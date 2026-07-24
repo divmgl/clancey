@@ -44,6 +44,10 @@ import { inferCaller } from "./caller.js";
 const EMPTY_LOOKUP_HINT =
   "No matches — the index was re-checked for new transcripts before answering. Broaden before giving up: fewer or shorter keywords, drop repo/branch/host, or grep_turns for literal wording.";
 
+/** An upgrade is re-reading history in the background; recent sessions are already searchable. */
+const MIGRATING_NOTE =
+  "(the index is upgrading in the background — newest conversations are already searchable, older ones are still being re-read; retry in a minute before falling back to reading files)";
+
 /**
  * Lookups that come back empty re-ingest once and retry, because "nothing found" and "your last
  * hour of work isn't indexed yet" are indistinguishable to the caller — and the second one sent
@@ -62,14 +66,18 @@ async function withAutoRefresh<T>(
   const now = Date.now();
   if (now - lastAutoRefresh < AUTO_REFRESH_THROTTLE_MS) return first;
   lastAutoRefresh = now;
+  let migrating = false;
   try {
-    await backfill(db, { force: false });
+    migrating = (await backfill(db, { force: false, migration: "defer" })).migrating === true;
   } catch (err) {
     logError("auto-refresh before empty result failed", err);
     return first;
   }
   const retried = run();
-  if (retried.rows.length === 0) return first;
+  if (retried.rows.length === 0) {
+    // Say so rather than letting an agent conclude the index simply has nothing and go grepping.
+    return migrating ? { rows: first.rows, note: `${first.note}\n\n${MIGRATING_NOTE}` } : first;
+  }
   return { rows: retried.rows, note: `${retried.note}\n\n(found after refreshing the index)` };
 }
 
@@ -154,11 +162,39 @@ function text(s: string) {
 /** recall is a map, not a dump: enough to pick a session, not every path ever touched. */
 const RECALL_FILES_SHOWN = 12;
 const RECALL_SESSIONS_SHOWN = 8;
+const DEFAULT_RECALL_CHARS = 24_000;
+const MAX_RECALL_CHARS = 120_000;
 
-function formatWorkItems(items: WorkItem[]): string {
+/**
+ * Render a list under a character budget and hand back a cursor. Any tool that returns "all of
+ * it" eventually returns more than the caller can hold: recall over a long-lived branch produced
+ * 1.5 MB — 187% of a 200k context — because decisions and learnings were unbounded per item.
+ */
+function windowItems<T>(
+  items: T[],
+  render: (item: T) => string,
+  offset: number,
+  maxChars: number,
+): { body: string; nextOffset: number | null } {
+  const parts: string[] = [];
+  let used = 0;
+  let i = offset;
+  for (; i < items.length; i++) {
+    const piece = render(items[i]);
+    if (parts.length > 0 && used + piece.length > maxChars) break;
+    // The first item always goes out, truncated if it alone busts the budget — a cursor that
+    // can't advance past a huge item is a dead end.
+    parts.push(piece.length > maxChars ? `${piece.slice(0, maxChars)}\n… (item truncated)` : piece);
+    used += Math.min(piece.length, maxChars) + 2;
+  }
+  return { body: parts.join("\n\n"), nextOffset: i < items.length ? i : null };
+}
+
+function formatWorkItems(items: WorkItem[], offset = 0, maxChars = DEFAULT_RECALL_CHARS): string {
   if (items.length === 0) return EMPTY_LOOKUP_HINT;
-  return items
-    .map((w) => {
+  const { body, nextOffset } = windowItems(
+    items,
+    (w) => {
       const hostBit = w.hosts.length ? ` · hosts: ${w.hosts.join(", ")}` : "";
       // Absolute paths for every file a branch ever touched ran to tens of KB per item and
       // buried the sessions — which are the part a caller can actually act on.
@@ -185,8 +221,14 @@ function formatWorkItems(items: WorkItem[]): string {
         }
       }
       return lines.join("\n");
-    })
-    .join("\n\n");
+    },
+    offset,
+    maxChars,
+  );
+  const shownTo = nextOffset ?? items.length;
+  const header = `Work items ${offset + 1}-${shownTo} of ${items.length}`;
+  const more = nextOffset === null ? "" : `\nMore: recall({ offset: ${nextOffset} })`;
+  return `${header}${more}\n\n${body}`;
 }
 
 /** Label a hit by who said it: `user`, `assistant`, or `assistant·Plan` for a subagent. */
@@ -290,6 +332,11 @@ function buildServer(db: Store): Server {
             ...SCOPE_PROPS,
             file: { type: "string", description: "Substring of an edited file path" },
             limit: { type: "number", description: "Max work items (default: all)" },
+            offset: { type: "number", description: "Start at this work item (0-based) — use the cursor from a previous call" },
+            max_chars: {
+              type: "number",
+              description: `Character budget for this window (default ${DEFAULT_RECALL_CHARS}, max ${MAX_RECALL_CHARS})`,
+            },
           },
         },
       },
@@ -604,7 +651,9 @@ function buildServer(db: Store): Server {
           const { rows: items, note } = await withAutoRefresh(db, () =>
             widenIfEmpty(scope, (s) => recall(db, { ...s, file: args.file as string | undefined })),
           );
-          return text(formatWorkItems(items) + note);
+          const offset = clampNumber(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+          const maxChars = clampNumber(args.max_chars, DEFAULT_RECALL_CHARS, 1_000, MAX_RECALL_CHARS);
+          return text(formatWorkItems(items, offset, maxChars) + note);
         }
         case "search": {
           const query = args.query as string;
@@ -680,8 +729,11 @@ function buildServer(db: Store): Server {
         }
         case "refresh_index": {
           const force = Boolean(args.force);
-          const stats = await backfill(db, { force });
+          // `force` is an explicit "do the whole thing now" and may take minutes; a plain refresh
+          // stays quick and lets the watcher finish any outstanding re-read.
+          const stats = await backfill(db, { force, migration: force ? "inline" : "defer" });
           const totals = storeTotals(db);
+          if (stats.migrating) return text(`Index healed; history is being re-read in the background. ${MIGRATING_NOTE}`);
           return text(
             `Index refreshed: ${stats.sessions} sessions, ${stats.events} events, ${stats.embeddings} embeddings ` +
               `(totals: ${totals.sessions} sessions, ${totals.events} events, ${totals.embeddings} embeddings)`,

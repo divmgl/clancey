@@ -30,6 +30,8 @@ import {
   ingestVersionChanged,
   markIngestVersion,
   clearAllIngestCursors,
+  isReingestPending,
+  setReingestPending,
   healRepoAttribution,
   healNoteSessions,
   CLANCEY_DIR,
@@ -60,6 +62,8 @@ export type Target = "claude" | "codex" | "opencode" | "grok" | "hermes";
 
 const POST_TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|search_replace|run_terminal_command";
 const FRAMING_MAX_CHARS = 2000;
+/** Cap on a single pacing rest, so one huge session can't stall the scan for minutes. */
+const MAX_PACE_REST_MS = 2_000;
 const LEGACY_INDEX = path.join(CLANCEY_DIR, "conversations.lance");
 
 /**
@@ -71,6 +75,24 @@ function deriveTitle(framing: string | null): string | null {
   const line = framing.replace(/\s+/g, " ").trim();
   if (!line) return null;
   return line.length > 90 ? `${line.slice(0, 87)}…` : line;
+}
+
+/**
+ * Most-recently-touched transcripts first. Scan order is invisible on an incremental pass, but
+ * during a full re-read it decides what is searchable in the first seconds versus the last
+ * minute — and what people ask about is what they were just working on. One stat per transcript.
+ */
+async function newestFirst<T extends { path: string }>(refs: T[]): Promise<T[]> {
+  const stamped = await Promise.all(
+    refs.map(async (ref) => ({
+      ref,
+      mtime: await fs.promises.stat(ref.path).then(
+        (s) => s.mtimeMs,
+        () => 0,
+      ),
+    })),
+  );
+  return stamped.sort((a, b) => b.mtime - a.mtime).map((s) => s.ref);
 }
 
 /** Build the search anchor text for a session's framing embedding. */
@@ -103,8 +125,11 @@ function isPrefixOf(cursor: IngestCursor, parsed: ParsedTranscript): boolean {
  */
 export async function backfill(
   db: Store,
-  opts: { force?: boolean } = {},
-): Promise<{ sessions: number; events: number; embeddings: number }> {
+  opts: { force?: boolean; migration?: "inline" | "defer"; pace?: number } = {},
+): Promise<{ sessions: number; events: number; embeddings: number; migrating?: boolean }> {
+  // Fraction of a core the scan may use. A foreground `clancey backfill` was asked for and
+  // should finish; the watcher is a daemon nobody asked for and must stay out of the way.
+  const pace = Math.min(1, Math.max(0.05, opts.pace ?? 1));
   const transcripts = await listAllTranscripts();
   // Canonical repo keys, resolved once per cwd (each miss shells out to git). Keys learned in
   // this run feed back in, so a deleted worktree can still be matched against a repo we've
@@ -121,22 +146,33 @@ export async function backfill(
     return resolved;
   };
 
-  // A stored shape older than INGEST_VERSION gets healed in place (instant) and then re-ingested
-  // (thorough) — the heal is what keeps scoped lookups working while the re-read is in flight.
+  // A stored shape older than INGEST_VERSION gets healed in place and then re-ingested. The two
+  // halves have very different costs: the heal is ~3s of SQL that restores scoped lookups, while
+  // the re-read is minutes of transcript parsing that only fills in newly-added fields. Clearing
+  // the cursors is what schedules the re-read, and it survives a crash — any session that hasn't
+  // been re-ingested still has no cursor, so the next pass picks it up.
   const reingest = opts.force || ingestVersionChanged(db);
   if (ingestVersionChanged(db)) {
     healRepoAttribution(db, (repo) => resolveRepo(repo));
     healNoteSessions(db);
     clearAllIngestCursors(db);
+    setReingestPending(db, true);
     markIngestVersion(db);
+  }
+
+  // An MCP tool call must not block for minutes on the re-read. Heal, then hand the scan to the
+  // watcher, which is already running and will work through the cleared cursors.
+  if (opts.migration === "defer" && isReingestPending(db)) {
+    return { sessions: 0, events: 0, embeddings: 0, migrating: true };
   }
 
   let sessions = 0;
   let events = 0;
   let embeddings = 0;
 
-  for (const ref of transcripts) {
+  for (const ref of await newestFirst(transcripts)) {
     const file = ref.path;
+    const unitStart = Date.now();
 
     // A session and its subagents are one ingest unit: subagent turns fold under the parent
     // session id, and deleteSession() wipes the whole unit before re-inserting. Gate on the
@@ -291,10 +327,22 @@ export async function backfill(
     });
     apply();
     sessions++;
+
+    // Parsing a session is a synchronous CPU burst; left unchecked the loop pins one core for
+    // the whole scan. Resting in proportion to the work just done holds it near `pace` without
+    // needing to know how big the next session is.
+    if (pace < 1) {
+      const worked = Date.now() - unitStart;
+      const rest = Math.round(worked * (1 / pace - 1));
+      if (rest > 0) await new Promise((r) => setTimeout(r, Math.min(rest, MAX_PACE_REST_MS)));
+    }
   }
 
   const retentionDays = getRetentionDays(db);
   if (retentionDays > 0) pruneOlderThan(db, retentionDays);
+
+  // Every transcript has been walked, so nothing is owed any more.
+  if (isReingestPending(db)) setReingestPending(db, false);
 
   return { sessions, events, embeddings };
 }

@@ -97,13 +97,18 @@ export function canonicalRepo(cwd: string | null, knownKeys: readonly string[] =
   if (!cwd) return null;
   const abs = cwd.startsWith("~") ? path.join(process.env.HOME || "", cwd.slice(1)) : cwd;
 
-  for (let dir = abs; ; dir = path.dirname(dir)) {
-    if (fs.existsSync(dir)) {
-      const root = repoKey(dir);
-      if (root) return remoteShortKey(root) ?? root;
-      break;
+  // Only an absolute path names a checkout. A short key like "fifthdoor/gaia" must not be walked:
+  // every segment fails to exist, the walk lands on ".", and the answer becomes whatever repo the
+  // process happens to be running in — which silently relabels other repos' history.
+  if (path.isAbsolute(abs)) {
+    for (let dir = abs; ; dir = path.dirname(dir)) {
+      if (fs.existsSync(dir)) {
+        const root = repoKey(dir);
+        if (root) return remoteShortKey(root) ?? root;
+        break;
+      }
+      if (path.dirname(dir) === dir) break;
     }
-    if (path.dirname(dir) === dir) break;
   }
 
   const bySlug = new Map<string, string>();

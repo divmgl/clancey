@@ -39,11 +39,18 @@ function defaultSleep(ms: number): Promise<void> {
  * Exported so tests drive the real entry (not a re-implemented insert).
  * Lifecycle tests set CLANCEY_WATCH_DRY=1 to skip a multi-minute full-world scan.
  */
+/**
+ * The watcher runs unattended for hours, including the multi-minute re-read after a version
+ * bump. Half a core keeps that invisible on a laptop; steady-state cycles touch a handful of
+ * sessions and finish in well under a second either way.
+ */
+const WATCH_PACE = 0.5;
+
 export async function defaultWatchIngest(dbPath: string): Promise<{ sessions: number }> {
   if (process.env.CLANCEY_WATCH_DRY === "1") return { sessions: 0 };
   const db = openStore(dbPath);
   try {
-    const stats = await backfill(db, { force: false });
+    const stats = await backfill(db, { force: false, pace: WATCH_PACE });
     maybeCheckpoint(db);
     return { sessions: stats.sessions };
   } finally {
