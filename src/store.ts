@@ -111,12 +111,16 @@ export interface WorkItem {
 
 export interface SearchHit {
   session: string;
+  title: string | null;
   repo: string | null;
   branch: string | null;
   kind: string;
   text: string;
   score: number;
   host: Host | null;
+  ts: string | null;
+  /** Which retrievers found this: semantic, keyword, or both. */
+  matched: ("semantic" | "keyword")[];
 }
 
 export interface TimeFilter {
@@ -137,11 +141,15 @@ export interface SearchOptions extends TimeFilter {
 
 export interface SessionSummary {
   session: string;
+  title: string | null;
   host: Host | null;
   repo: string | null;
   branch: string | null;
   firstTs: string;
   lastTs: string;
+  /** Stored turns and their total text size — how big a read_turns on this session would be. */
+  turns: number;
+  bytes: number;
 }
 
 export function openStore(dbPath: string = resolveDbPath()): Store {
@@ -149,8 +157,25 @@ export function openStore(dbPath: string = resolveDbPath()): Store {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
+  // Long-lived MCP readers keep the auto-checkpointer from resetting the WAL, so it grows
+  // unbounded (hundreds of MB observed). A tighter threshold plus the explicit truncating
+  // checkpoint the watcher runs keeps it bounded.
+  db.pragma("wal_autocheckpoint = 512");
   migrate(db);
   return db;
+}
+
+/**
+ * Fold the WAL back into the main db and truncate it. Best-effort: TRUNCATE needs a moment
+ * with no active readers, so a busy result is normal and simply retried next cycle.
+ */
+export function checkpointWal(db: Store): "ok" | "busy" {
+  try {
+    const [row] = db.pragma("wal_checkpoint(TRUNCATE)") as { busy: number }[];
+    return row && row.busy === 0 ? "ok" : "busy";
+  } catch {
+    return "busy";
+  }
 }
 
 function migrate(db: Store): void {
@@ -224,6 +249,17 @@ function migrate(db: Store): void {
       mtime_ms REAL NOT NULL
     );
 
+    -- One row per session: the human-readable identity of a conversation. Hit lists that show
+    -- only an opaque uuid force a read_turns on every candidate just to find out what it was.
+    CREATE TABLE IF NOT EXISTS sessions (
+      session TEXT PRIMARY KEY,
+      title   TEXT,
+      host    TEXT,
+      repo    TEXT,
+      branch  TEXT,
+      cwd     TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS meta (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -237,6 +273,12 @@ function migrate(db: Store): void {
   addColumnIfMissing(db, "embeddings", "host", "TEXT");
   addColumnIfMissing(db, "messages", "host", "TEXT");
   addColumnIfMissing(db, "messages", "repo", "TEXT");
+  // Per-stream ingest cursor: how much of this file we already stored, so an append-only
+  // transcript re-ingests only its tail instead of being deleted and rewritten wholesale.
+  addColumnIfMissing(db, "ingested", "msg_count", "INTEGER");
+  addColumnIfMissing(db, "ingested", "ev_count", "INTEGER");
+  addColumnIfMissing(db, "ingested", "last_ts", "TEXT");
+  addColumnIfMissing(db, "ingested", "last_id", "INTEGER");
   ensureMessagesFts(db);
   // The legacy human-only `turns` snapshot is superseded by `messages` (which stores user turns
   // too). Drop it so we don't keep a second copy of every human turn; `backfill --force`
@@ -315,6 +357,62 @@ function addColumnIfMissing(db: Store, table: string, column: string, decl: stri
   if (!cols.some((c) => c.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
+}
+
+/**
+ * Record a session's identity. Nulls never overwrite something we already knew — a later
+ * ingest pass that can't see the title (pruned transcript, partial host data) must not erase it.
+ */
+export function upsertSessionCard(
+  db: Store,
+  card: { session: string; title?: string | null; host?: string | null; repo?: string | null; branch?: string | null; cwd?: string | null },
+): void {
+  db.prepare(
+    `INSERT INTO sessions (session, title, host, repo, branch, cwd)
+     VALUES (@session, @title, @host, @repo, @branch, @cwd)
+     ON CONFLICT(session) DO UPDATE SET
+       title  = COALESCE(excluded.title, sessions.title),
+       host   = COALESCE(excluded.host, sessions.host),
+       repo   = COALESCE(excluded.repo, sessions.repo),
+       branch = COALESCE(excluded.branch, sessions.branch),
+       cwd    = COALESCE(excluded.cwd, sessions.cwd)`,
+  ).run({
+    session: card.session,
+    title: card.title ?? null,
+    host: card.host ?? null,
+    repo: card.repo ?? null,
+    branch: card.branch ?? null,
+    cwd: card.cwd ?? null,
+  });
+}
+
+/** Titles for a set of sessions, for annotating hit lists. */
+export function getSessionTitles(db: Store, sessions: readonly string[]): Map<string, string> {
+  const ids = [...new Set(sessions.filter(Boolean))];
+  if (ids.length === 0) return new Map();
+  const rows = db
+    .prepare(
+      `SELECT session, title FROM sessions
+       WHERE title IS NOT NULL AND title <> '' AND session IN (${ids.map(() => "?").join(", ")})`,
+    )
+    .all(...ids) as { session: string; title: string }[];
+  return new Map(rows.map((r) => [r.session, r.title]));
+}
+
+/** Turn count and stored size per session, so callers can judge a read_turns before making it. */
+export function getSessionSizes(
+  db: Store,
+  sessions: readonly string[],
+): Map<string, { turns: number; bytes: number }> {
+  const ids = [...new Set(sessions.filter(Boolean))];
+  if (ids.length === 0) return new Map();
+  const rows = db
+    .prepare(
+      `SELECT session, count(*) AS turns, COALESCE(sum(length(text)), 0) AS bytes
+       FROM messages WHERE session IN (${ids.map(() => "?").join(", ")}) GROUP BY session`,
+    )
+    .all(...ids) as { session: string; turns: number; bytes: number }[];
+  return new Map(rows.map((r) => [r.session, { turns: r.turns, bytes: r.bytes }]));
 }
 
 export function getMeta(db: Store, key: string): string | undefined {
@@ -456,18 +554,20 @@ export function deleteNote(db: Store, id: number): boolean {
   return true;
 }
 
-/** Snapshot a full conversation message (any role, including subagents) and index it for grep. */
-export function insertMessage(db: Store, m: MessageInput): void {
+/**
+ * Snapshot a full conversation message (any role, including subagents) and index it for grep.
+ * Returns the row id so an incremental ingest can revisit a turn that is still being streamed.
+ */
+export function insertMessage(db: Store, m: MessageInput): number {
   const info = db
     .prepare(
       `INSERT INTO messages (session, ts, branch, role, agent, agent_id, text, host, repo)
        VALUES (@session, @ts, @branch, @role, @agent, @agentId, @text, @host, @repo)`,
     )
     .run({ ...m, host: m.host ?? null, repo: m.repo ?? null });
-  db.prepare(`INSERT INTO messages_fts (rowid, text) VALUES (@rowid, @text)`).run({
-    rowid: Number(info.lastInsertRowid),
-    text: m.text,
-  });
+  const id = Number(info.lastInsertRowid);
+  db.prepare(`INSERT INTO messages_fts (rowid, text) VALUES (@rowid, @text)`).run({ rowid: id, text: m.text });
+  return id;
 }
 
 export function getMessages(db: Store, session: string, branch?: string): StoredMessage[] {
@@ -511,6 +611,93 @@ export function listKnownRepos(db: Store): string[] {
     )
     .all() as { repo: string }[];
   return rows.map((r) => r.repo);
+}
+
+/**
+ * Bumped whenever ingest changes what gets *stored* (not how it's queried). A mismatch makes
+ * the next backfill drop its cursors and re-read every transcript, so shape fixes reach existing
+ * databases on their own — `--force` is a flag nobody remembers to run.
+ */
+export const INGEST_VERSION = 3;
+
+export function ingestVersionChanged(db: Store): boolean {
+  return getMeta(db, "ingest_version") !== String(INGEST_VERSION);
+}
+
+export function markIngestVersion(db: Store): void {
+  setMeta(db, "ingest_version", String(INGEST_VERSION));
+}
+
+/** Drop every ingest cursor so the next backfill re-reads all transcripts from scratch. */
+export function clearAllIngestCursors(db: Store): void {
+  db.exec(`DELETE FROM ingested`);
+}
+
+/**
+ * Repair repo attribution on rows already in the store, so scoped lookups work immediately
+ * instead of waiting out a full re-ingest. Two passes:
+ *
+ * 1. Sessions whose messages have no repo but whose tool events do (the common shape: repo was
+ *    only ever derived from the first tool event, so a session that edited nothing was unscoped).
+ * 2. Every distinct repo value through `canonicalize`, collapsing worktrees, subdirectories and
+ *    path-vs-`owner/name` spellings of the same repo onto one key.
+ */
+export function healRepoAttribution(
+  db: Store,
+  canonicalize: (repo: string) => string | null,
+): { linked: number; canonicalized: number } {
+  const linked = db
+    .prepare(
+      `UPDATE messages SET repo = (
+         SELECT e.repo FROM events e
+         WHERE e.session = messages.session AND e.repo IS NOT NULL AND e.repo <> ''
+         LIMIT 1
+       )
+       WHERE (repo IS NULL OR repo = '')
+         AND EXISTS (
+           SELECT 1 FROM events e
+           WHERE e.session = messages.session AND e.repo IS NOT NULL AND e.repo <> ''
+         )`,
+    )
+    .run().changes;
+
+  let canonicalized = 0;
+  for (const stored of listKnownRepos(db)) {
+    const canonical = canonicalize(stored);
+    if (!canonical || canonical === stored) continue;
+    for (const table of ["messages", "events", "embeddings"]) {
+      canonicalized += db
+        .prepare(`UPDATE ${table} SET repo = @canonical WHERE repo = @stored`)
+        .run({ canonical, stored }).changes;
+    }
+  }
+  return { linked, canonicalized };
+}
+
+/** How far a note's timestamp may sit from a session's activity and still belong to it. */
+const NOTE_LINK_WINDOW_MINUTES = 45;
+
+/**
+ * Link recorded decisions/learnings that were saved without a session id back to the
+ * conversation that produced them, by repo and time. Unanchored notes are the worst kind of
+ * search hit: they assert something was decided but give the reader nothing to read back.
+ */
+export function healNoteSessions(db: Store): number {
+  return db
+    .prepare(
+      `UPDATE events SET session = (
+         SELECT m.session FROM messages m
+         WHERE m.repo = events.repo
+           AND m.session IS NOT NULL AND m.session <> ''
+           AND ABS(julianday(m.ts) - julianday(events.ts)) * 1440 <= @window
+         ORDER BY ABS(julianday(m.ts) - julianday(events.ts))
+         LIMIT 1
+       )
+       WHERE type IN ('decision', 'learning')
+         AND (session IS NULL OR session = '')
+         AND repo IS NOT NULL AND repo <> ''`,
+    )
+    .run({ window: NOTE_LINK_WINDOW_MINUTES }).changes;
 }
 
 /** Bind `repo IN (...)` or `repo = @repo` from a single key or expanded list. */
@@ -712,26 +899,51 @@ export function recall(
 
 export interface TurnHit {
   session: string;
+  title: string | null;
   branch: string | null;
   ts: string;
   role: string;
   agent: string | null;
   snippet: string;
+  /** Opening of the turn that came next — usually the answer to the turn that matched. */
+  reply: string | null;
   host: Host | null;
   repo: string | null;
 }
 
 /**
- * Turn a free-text query into a safe FTS5 MATCH expression: extract word tokens,
- * quote each (so punctuation and FTS operators can't break the syntax), and OR them.
- * OR (not AND) keeps this a forgiving fallback — a turn matching most of the words
- * still surfaces, ranked above weaker matches by BM25, instead of one absent word
- * wiping out every result. Returns null when the query has no searchable tokens.
+ * Words that carry no signal in a conversation index but dominate an OR query — every
+ * transcript contains "the" and "we", so including them ranks noise above real matches.
  */
-function ftsQuery(raw: string): string | null {
-  const terms = raw.match(/[\p{L}\p{N}]+/gu);
-  if (!terms || terms.length === 0) return null;
-  return terms.map((t) => `"${t}"`).join(" OR ");
+const FTS_STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "did", "do", "does", "for",
+  "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "of",
+  "on", "or", "our", "so", "that", "the", "their", "them", "then", "there", "these", "they",
+  "this", "to", "was", "we", "were", "what", "when", "where", "which", "why", "with", "you",
+  "your",
+]);
+
+/**
+ * Compile a free-text query into two FTS5 MATCH expressions, strict then loose.
+ *
+ * Strict ANDs the terms: a turn has to contain all of them, which is what someone asking for
+ * "horde leave token" actually means. Loose ORs them as a fallback so a single absent word
+ * can't empty the result. `"quoted runs"` stay phrases in both. Stopwords are dropped unless
+ * that would leave nothing to search for.
+ */
+export function ftsQueries(raw: string): { strict: string; loose: string } | null {
+  const phrases: string[] = [];
+  const rest = raw.replace(/"([^"]+)"/g, (_m, inner: string) => {
+    const words = (inner.match(/[\p{L}\p{N}]+/gu) ?? []).join(" ");
+    if (words) phrases.push(`"${words}"`);
+    return " ";
+  });
+
+  const words = rest.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const meaningful = words.filter((w) => !FTS_STOPWORDS.has(w.toLowerCase()));
+  const terms = [...phrases, ...(meaningful.length ? meaningful : words).map((w) => `"${w}"`)];
+  if (terms.length === 0) return null;
+  return { strict: terms.join(" AND "), loose: terms.join(" OR ") };
 }
 
 /**
@@ -774,47 +986,99 @@ function scopeWhere(
   return where.length ? ` AND ${where.join(" AND ")}` : "";
 }
 
+/** At most this many hits from one conversation, so a chatty session can't fill the page. */
+const MAX_HITS_PER_SESSION = 2;
+/** FTS5 snippet width in tokens (its maximum) — a 16-token window cut off the useful part. */
+const SNIPPET_TOKENS = 64;
+const REPLY_PREVIEW_CHARS = 240;
+/** Pull extra rows so per-session capping still fills the page. */
+const OVERFETCH = 8;
+
 export function grepTurns(db: Store, query: string, opts: number | SearchOptions = 8): TurnHit[] {
-  const match = ftsQuery(query);
-  if (!match) return [];
+  const compiled = ftsQueries(query);
+  if (!compiled) return [];
   const options = searchOptions(opts);
-  const params: Record<string, string | number> = { match, limit: options.limit ?? 8 };
-  // Scope columns live on the joined `messages` row (alias m).
-  // Keep messages_fts unaliased so MATCH/snippet/rank bind correctly under better-sqlite3.
-  const scope = scopeWhere("m", options, params);
-  // Prefer columns from `messages` (content table). FTS5 joined tables reject
-  // messages_fts.col qualification in SELECT under better-sqlite3.
-  const rows = db
-    .prepare(
-      `SELECT m.session AS session, m.branch AS branch, m.ts AS ts, m.role AS role, m.agent AS agent,
-              snippet(messages_fts, 0, '«', '»', '…', 16) AS snippet,
-              m.host AS host, m.repo AS repo
-       FROM messages_fts
-       JOIN messages m ON m.id = messages_fts.rowid
-       WHERE messages_fts MATCH @match
-       ${scope}
-       ORDER BY rank LIMIT @limit`,
-    )
-    .all(params) as {
-    session: string;
-    branch: string | null;
-    ts: string;
-    role: string;
-    agent: string | null;
-    snippet: string;
-    host: string | null;
-    repo: string | null;
-  }[];
-  return rows.map((r) => ({
+  const limit = options.limit ?? 8;
+
+  const run = (match: string): RawTurnRow[] => {
+    const params: Record<string, string | number> = { match, limit: limit * OVERFETCH };
+    // Scope columns live on the joined `messages` row (alias m).
+    // Keep messages_fts unaliased so MATCH/snippet/rank bind correctly under better-sqlite3.
+    const scope = scopeWhere("m", options, params);
+    // Prefer columns from `messages` (content table). FTS5 joined tables reject
+    // messages_fts.col qualification in SELECT under better-sqlite3.
+    return db
+      .prepare(
+        `SELECT m.id AS id, m.session AS session, m.branch AS branch, m.ts AS ts, m.role AS role,
+                m.agent AS agent,
+                snippet(messages_fts, 0, '«', '»', '…', ${SNIPPET_TOKENS}) AS snippet,
+                m.host AS host, m.repo AS repo
+         FROM messages_fts
+         JOIN messages m ON m.id = messages_fts.rowid
+         WHERE messages_fts MATCH @match
+         ${scope}
+         ORDER BY rank LIMIT @limit`,
+      )
+      .all(params) as RawTurnRow[];
+  };
+
+  // All words, then any word: an exact-ish match is worth far more than a turn that happened
+  // to contain one common term, but a single missing word must not empty the result either.
+  let rows = run(compiled.strict);
+  if (rows.length === 0 && compiled.loose !== compiled.strict) rows = run(compiled.loose);
+
+  const perSession = new Map<string, number>();
+  const kept: RawTurnRow[] = [];
+  for (const row of rows) {
+    const seen = perSession.get(row.session) ?? 0;
+    if (seen >= MAX_HITS_PER_SESSION) continue;
+    perSession.set(row.session, seen + 1);
+    kept.push(row);
+    if (kept.length >= limit) break;
+  }
+
+  const titles = getSessionTitles(db, kept.map((r) => r.session));
+  return kept.map((r) => ({
     session: r.session,
+    title: titles.get(r.session) ?? null,
     branch: r.branch,
     ts: r.ts,
     role: r.role,
     agent: r.agent,
     snippet: r.snippet,
+    reply: nextTurnPreview(db, r.id, r.session),
     host: normalizeHost(r.host),
     repo: r.repo,
   }));
+}
+
+interface RawTurnRow {
+  id: number;
+  session: string;
+  branch: string | null;
+  ts: string;
+  role: string;
+  agent: string | null;
+  snippet: string;
+  host: string | null;
+  repo: string | null;
+}
+
+/**
+ * Opening of the turn that followed a hit. A question found on its own is rarely the answer;
+ * showing the reply is usually the difference between one grep and a follow-up read_turns.
+ */
+function nextTurnPreview(db: Store, id: number, session: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT role, agent, text FROM messages
+       WHERE session = @session AND id > @id ORDER BY id LIMIT 1`,
+    )
+    .get({ session, id }) as { role: string; agent: string | null; text: string } | undefined;
+  if (!row) return null;
+  const who = row.agent ? `${row.role}·${row.agent}` : row.role;
+  const body = row.text.replace(/\s+/g, " ").trim().slice(0, REPLY_PREVIEW_CHARS);
+  return body ? `[${who}] ${body}${row.text.length > REPLY_PREVIEW_CHARS ? "…" : ""}` : null;
 }
 
 export function search(db: Store, queryVector: number[], opts: number | SearchOptions = 8): SearchHit[] {
@@ -844,7 +1108,7 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
   if (ex) where.push(ex);
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const rows = db
-    .prepare(`SELECT session, repo, branch, kind, text, vector, host FROM embeddings ${clause}`)
+    .prepare(`SELECT session, repo, branch, kind, text, vector, host, ts FROM embeddings ${clause}`)
     .all(params) as {
     session: string;
     repo: string | null;
@@ -853,20 +1117,120 @@ export function search(db: Store, queryVector: number[], opts: number | SearchOp
     text: string;
     vector: Buffer;
     host: string | null;
+    ts: string;
   }[];
 
-  return rows
+  const scored = rows
     .map((r) => ({
       session: r.session,
+      title: null as string | null,
       repo: r.repo,
       branch: r.branch,
       kind: r.kind,
       text: r.text,
       score: cosineSimilarity(queryVector, blobToVector(r.vector)),
       host: normalizeHost(r.host),
+      ts: r.ts as string | null,
+      matched: ["semantic"] as ("semantic" | "keyword")[],
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, options.limit ?? 8);
+  const titles = getSessionTitles(db, scored.map((h) => h.session));
+  for (const hit of scored) hit.title = titles.get(hit.session) ?? null;
+  return scored;
+}
+
+/**
+ * Rank-fusion constant. The standard reciprocal-rank-fusion damping: position 1 is worth
+ * 1/61, position 10 worth 1/70 — close enough that agreement between retrievers outweighs
+ * a narrow win in either one.
+ */
+const RRF_K = 60;
+/** Candidates pulled from each retriever before fusion. */
+const FUSION_CANDIDATES = 200;
+
+/**
+ * Search the conversation index by meaning *and* by wording.
+ *
+ * Pure vector search here ranks over framings and recorded notes only — about 1% of what's
+ * stored — so anything said mid-conversation was unfindable and every result looked weak.
+ * Fusing in a BM25 pass over the full turn text puts the other 99% back in play. Reciprocal
+ * rank fusion is what merges them: it needs no shared score scale (cosine and BM25 have none),
+ * and a session both retrievers like beats one that only either does. A third recency list
+ * breaks ties toward work that is still relevant.
+ */
+export function hybridSearch(
+  db: Store,
+  queryText: string,
+  queryVector: number[],
+  opts: number | SearchOptions = 8,
+): SearchHit[] {
+  const options = searchOptions(opts);
+  const limit = options.limit ?? 8;
+
+  const semantic = search(db, queryVector, { ...options, limit: FUSION_CANDIDATES });
+  const keyword = keywordCandidates(db, queryText, { ...options, limit: FUSION_CANDIDATES });
+
+  const byKey = new Map<string, SearchHit>();
+  const fused = new Map<string, number>();
+  const addList = (hits: SearchHit[], weight: number) => {
+    hits.forEach((hit, i) => {
+      const key = hit.session || `${hit.kind}:${hit.text.slice(0, 64)}`;
+      const existing = byKey.get(key);
+      if (!existing) {
+        byKey.set(key, { ...hit });
+      } else if (!existing.matched.includes(hit.matched[0])) {
+        existing.matched = [...existing.matched, ...hit.matched];
+        // A framing or recorded decision says what the session was about; a matching turn only
+        // proves the words occur. Keep the descriptive text, keep both signals.
+        if (existing.kind === "turn" && hit.kind !== "turn") {
+          existing.kind = hit.kind;
+          existing.text = hit.text;
+        }
+      }
+      fused.set(key, (fused.get(key) ?? 0) + weight / (RRF_K + i + 1));
+    });
+  };
+
+  addList(semantic, 1);
+  addList(keyword, 1);
+
+  const recent = [...byKey.values()]
+    .filter((h) => h.ts)
+    .sort((a, b) => (a.ts! < b.ts! ? 1 : a.ts! > b.ts! ? -1 : 0));
+  addList(recent, RECENCY_WEIGHT);
+
+  return [...byKey.entries()]
+    .map(([key, hit]) => ({ ...hit, score: fused.get(key) ?? 0 }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+/** Recency is a tiebreaker, not a ranking signal — a third of a retriever's vote. */
+const RECENCY_WEIGHT = 0.33;
+
+/** BM25-ranked turns, one per session, shaped as search hits for fusion. */
+function keywordCandidates(db: Store, query: string, opts: SearchOptions): SearchHit[] {
+  const turns = grepTurns(db, query, { ...opts, limit: opts.limit ?? FUSION_CANDIDATES });
+  const seen = new Set<string>();
+  const hits: SearchHit[] = [];
+  for (const t of turns) {
+    if (seen.has(t.session)) continue;
+    seen.add(t.session);
+    hits.push({
+      session: t.session,
+      title: t.title,
+      repo: t.repo,
+      branch: t.branch,
+      kind: "turn",
+      text: t.snippet.replace(/\s+/g, " ").trim(),
+      score: 0,
+      host: t.host,
+      ts: t.ts,
+      matched: ["keyword"],
+    });
+  }
+  return hits;
 }
 
 /**
@@ -928,13 +1292,19 @@ export function listRecentSessions(
     branch: string | null;
   }[];
 
+  const ids = rows.map((r) => r.session);
+  const titles = getSessionTitles(db, ids);
+  const sizes = getSessionSizes(db, ids);
   return rows.map((r) => ({
     session: r.session,
+    title: titles.get(r.session) ?? null,
     host: normalizeHost(r.host),
     repo: r.repo,
     branch: r.branch,
     firstTs: r.firstTs,
     lastTs: r.lastTs,
+    turns: sizes.get(r.session)?.turns ?? 0,
+    bytes: sizes.get(r.session)?.bytes ?? 0,
   }));
 }
 
@@ -994,10 +1364,84 @@ export function setIngested(db: Store, filePath: string, mtimeMs: number): void 
   ).run(filePath, mtimeMs);
 }
 
-/** Remove all rows sourced from a transcript (idempotent re-ingest). */
-export function deleteSession(db: Store, session: string): void {
+/**
+ * How much of one transcript stream (a parent transcript or a single subagent file) is
+ * already in the store. `lastTs` is the timestamp of the last message we wrote, used to
+ * confirm the stored rows really are a prefix of what we just parsed.
+ */
+export interface IngestCursor {
+  msgCount: number;
+  evCount: number;
+  lastTs: string | null;
+  /** Row id of the last message written, whose text may still grow (streamed turns). */
+  lastId: number | null;
+}
+
+export function getIngestCursor(db: Store, filePath: string): IngestCursor | undefined {
+  const row = db
+    .prepare(`SELECT msg_count, ev_count, last_ts, last_id FROM ingested WHERE path = ?`)
+    .get(filePath) as
+    | { msg_count: number | null; ev_count: number | null; last_ts: string | null; last_id: number | null }
+    | undefined;
+  if (!row || row.msg_count === null || row.ev_count === null) return undefined;
+  return { msgCount: row.msg_count, evCount: row.ev_count, lastTs: row.last_ts, lastId: row.last_id };
+}
+
+export function setIngestCursor(db: Store, filePath: string, mtimeMs: number, cursor: IngestCursor): void {
+  db.prepare(
+    `INSERT INTO ingested (path, mtime_ms, msg_count, ev_count, last_ts, last_id)
+     VALUES (@path, @mtime, @msgCount, @evCount, @lastTs, @lastId)
+     ON CONFLICT(path) DO UPDATE SET
+       mtime_ms = excluded.mtime_ms,
+       msg_count = excluded.msg_count,
+       ev_count = excluded.ev_count,
+       last_ts = excluded.last_ts,
+       last_id = excluded.last_id`,
+  ).run({ path: filePath, mtime: mtimeMs, ...cursor });
+}
+
+/** Text of a stored message, used to detect a streamed turn that grew since last ingest. */
+export function getMessageText(db: Store, id: number): string | undefined {
+  const row = db.prepare(`SELECT text FROM messages WHERE id = ?`).get(id) as { text: string } | undefined;
+  return row?.text;
+}
+
+/** Rewrite a message in place, keeping its FTS entry in sync (external-content index). */
+export function updateMessageText(db: Store, id: number, text: string): void {
+  const prev = getMessageText(db, id);
+  if (prev === undefined) return;
+  // External-content FTS wants the OLD text on delete so the inverted index unwinds cleanly.
+  db.prepare(`INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', @id, @prev)`).run({
+    id,
+    prev,
+  });
+  db.prepare(`UPDATE messages SET text = @text WHERE id = @id`).run({ id, text });
+  db.prepare(`INSERT INTO messages_fts (rowid, text) VALUES (@id, @text)`).run({ id, text });
+}
+
+/** Drop the ingest cursors for a unit so the next pass rewrites it from scratch. */
+export function clearIngestCursors(db: Store, filePaths: string[]): void {
+  const stmt = db.prepare(
+    `UPDATE ingested SET msg_count = NULL, ev_count = NULL, last_ts = NULL, last_id = NULL WHERE path = ?`,
+  );
+  for (const p of filePaths) stmt.run(p);
+}
+
+/** The stored framing text for a session, so an unchanged framing skips re-embedding. */
+export function getFramingText(db: Store, session: string): string | undefined {
+  const row = db
+    .prepare(`SELECT text FROM embeddings WHERE session = ? AND kind = 'framing' LIMIT 1`)
+    .get(session) as { text: string } | undefined;
+  return row?.text;
+}
+
+/**
+ * Remove all rows sourced from a transcript (idempotent re-ingest). `keepFraming` retains the
+ * session's framing embedding when its text is unchanged, so a rewrite doesn't re-run the model.
+ */
+export function deleteSession(db: Store, session: string, opts: { keepFraming?: boolean } = {}): void {
   db.prepare(`DELETE FROM events WHERE session = ? AND type = 'tool'`).run(session);
-  db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
+  if (!opts.keepFraming) db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(session);
   // Drop FTS rows by messages.id before deleting messages (external-content index).
   db.prepare(
     `DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE session = ?)`,

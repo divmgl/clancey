@@ -1,12 +1,6 @@
 ---
 name: clancey
-description: >
-  Find past AI coding conversations via the Clancey MCP server — which session
-  produced a branch, PR, file, or change; what was said or decided earlier; why
-  something was built a certain way; prior work that may have happened in another
-  coding agent. Prefer Clancey over guessing from git history alone. Also record
-  decisions and learnings when something important is settled so later search is
-  richer.
+description: Search past AI coding conversations across Claude Code, Grok Build, OpenCode, Codex and Hermes — which session produced a branch, PR, file or change; what was said, decided, or learned earlier; why something was built a certain way; where we left off. Use before guessing from git history or grepping transcript files on disk. Also records decisions and learnings so later search is richer.
 license: MIT
 compatibility: Requires the Clancey MCP server.
 metadata:
@@ -29,14 +23,16 @@ When the user asks about past work, **retrieve the conversation**. Do not invent
 |------|------|--------|
 | Branch, file, PR, or repo → sessions | `recall` | Deterministic map to sessions, files, hosts, and stored decisions/learnings. Start here when you have a concrete anchor. |
 | Recent sessions (browse) | `list_sessions` | By last activity; filter by repo/branch/host/time. Then `read_turns`. |
-| Topic without a branch | `search` | Semantic search over framings + decisions/learnings. Scope with repo/branch/host/time. |
+| Topic without a branch | `search` | Meaning **and** wording together (framings, decisions/learnings, and full turn text, fused). Scope with repo/branch/host/time. |
 | Exact words / offhand remarks | `grep_turns` | Keyword search over the full verbatim transcript, **including subagent turns** (speaker `assistant·AgentType`). |
-| Full session text | `read_turns` | Entire conversation for a session id. Optional **branch slice**. If the live transcript was pruned, Clancey serves the **stored snapshot**. |
+| Full session text | `read_turns` | Conversation for a session id, **one window at a time**. Optional **branch slice**. Continue with the `offset` in the response header, or jump to a hit with `around: "<ts from grep_turns>"`. If the live transcript was pruned, Clancey serves the **stored snapshot**. |
 | Stale / empty index | `refresh_index` | Re-ingest changed transcripts so recent work is findable. |
 
 Shared scope knobs (where supported): `repo`, `branch`, `host` (`claude` \| `codex` \| `opencode` \| `grok` \| `hermes`), `time` / `since` / `until`, `limit`, `exclude_session` / `exclude_sessions`.
 
-**Repo keys.** `repo` accepts an absolute checkout path **or** a short `owner/name` from the git remote — both match the same work when that remote is known. Prefer whichever form you have; do not conclude the index is empty just because one form returned nothing without trying the other (or dropping `repo`).
+**Repo keys.** `repo` accepts an absolute checkout path, a short `owner/name`, or just the repo name — all resolve to the same work. If a scoped lookup has no match, Clancey retries wider on its own and labels it (`no match in repo X — showing all repos`); treat that as "your filter was wrong", not "the repo has no history".
+
+**Never read the files yourself.** Empty results already mean Clancey re-checked for new transcripts before answering.
 
 ### Time windows (plain English)
 
@@ -59,7 +55,7 @@ Explicit `since` / `until` (ISO) override `time`.
 - Ground the answer in retrieved turns. Prefer `read_turns` over summarizing a single hit line.
 - Cite the session id (and host when shown). Subagent lines look like `[assistant·Plan]`.
 - If the live file is gone, trust snapshot text from `read_turns` (`transcript pruned; served from snapshot`).
-- **Prior sessions, not this one.** If the top hit is the current conversation (it restates the user’s question or matches your session id), that is not “index empty.” Call `list_sessions` for the repo/branch, then `read_turns` on **earlier** sessions — or pass `exclude_session: "<current id>"` on `search` / `grep_turns` / `list_sessions`. Only after that fails should you treat results as missing.
+- **Prior sessions, not this one.** Hits from the conversation you are in are marked `(this conversation)` and sorted last; that marker is not “index empty.” Call `list_sessions` for the repo/branch, then `read_turns` on **earlier** sessions — or pass `exclude_session: "<current id>"` on `search` / `grep_turns` / `list_sessions`. Only after that fails should you treat results as missing.
 - If nothing matches after that, say so. Call `refresh_index` when work should exist but still looks empty, then retry. Never fabricate a conversation. Never invent freshness metrics Clancey did not return.
 
 ### Examples
@@ -126,10 +122,10 @@ grep_turns({ query: "auth edge", time: "last 7 days" })
 Lookup works without this. Recording makes semantic search sharper when something durable was settled. Prefer a clear, useful entry over volume — one good decision beats several vague ones.
 
 **`record_decision`** — choice + rationale (why, alternatives rejected), not the diff.  
-Pass `session` (and `host` when known) so the note links back to the conversation.  
+`session`, `repo`, `branch` and `host` are filled in from the calling conversation when omitted; pass them explicitly only to override.  
 Typical moments: commit, PR open/update, root cause, approach choice, user correction.
 
-**`record_learning`** — non-obvious system fact (gotcha, constraint), not a choice. Same `session` / `host` guidance.
+**`record_learning`** — non-obvious system fact (gotcha, constraint), not a choice. Same auto-anchoring.
 
 Use `update_*` / `remove_*` with ids from `recall` to fix or drop bad entries.
 

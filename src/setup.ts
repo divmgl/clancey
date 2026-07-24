@@ -15,10 +15,23 @@ import {
   insertMessage,
   setIngested,
   getIngestedMtime,
+  getIngestCursor,
+  setIngestCursor,
+  getFramingText,
+  getMessageText,
+  updateMessageText,
+  IngestCursor,
   deleteSession,
   pruneOlderThan,
   getRetentionDays,
   storeTotals,
+  upsertSessionCard,
+  listKnownRepos,
+  ingestVersionChanged,
+  markIngestVersion,
+  clearAllIngestCursors,
+  healRepoAttribution,
+  healNoteSessions,
   CLANCEY_DIR,
 } from "./store.js";
 import {
@@ -37,7 +50,7 @@ import {
   SubagentRef,
 } from "./parser.js";
 import { embedOne } from "./embeddings.js";
-import { repoKey } from "./git.js";
+import { canonicalRepo } from "./git.js";
 import { setConsoleSilent } from "./logger.js";
 
 const tildify = (p: string) => p.replace(os.homedir(), "~");
@@ -49,9 +62,38 @@ const POST_TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|search_replace
 const FRAMING_MAX_CHARS = 2000;
 const LEGACY_INDEX = path.join(CLANCEY_DIR, "conversations.lance");
 
+/**
+ * Fall back to the opening ask when a host records no title (Codex records none at all).
+ * A card reading "(untitled)" is barely better than a bare uuid.
+ */
+function deriveTitle(framing: string | null): string | null {
+  if (!framing) return null;
+  const line = framing.replace(/\s+/g, " ").trim();
+  if (!line) return null;
+  return line.length > 90 ? `${line.slice(0, 87)}…` : line;
+}
+
 /** Build the search anchor text for a session's framing embedding. */
 function framingText(title: string | null, framing: string): string {
   return title ? `${title}\n\n${framing}` : framing;
+}
+
+/** One append-only source of turns: the parent transcript, or a single subagent file. */
+interface IngestStream {
+  path: string;
+  parsed: ParsedTranscript;
+  agent: string | null;
+}
+
+/**
+ * True when the rows we already stored for a stream are still a prefix of what we just parsed,
+ * so only the tail needs writing. Verified against the last stored timestamp, not just counts —
+ * a rewritten or compacted transcript falls back to a full re-ingest.
+ */
+function isPrefixOf(cursor: IngestCursor, parsed: ParsedTranscript): boolean {
+  if (cursor.msgCount > parsed.messages.length || cursor.evCount > parsed.toolEvents.length) return false;
+  if (cursor.msgCount === 0) return true;
+  return cursor.lastTs === parsed.messages[cursor.msgCount - 1].timestamp;
 }
 
 /**
@@ -64,14 +106,30 @@ export async function backfill(
   opts: { force?: boolean } = {},
 ): Promise<{ sessions: number; events: number; embeddings: number }> {
   const transcripts = await listAllTranscripts();
+  // Canonical repo keys, resolved once per cwd (each miss shells out to git). Keys learned in
+  // this run feed back in, so a deleted worktree can still be matched against a repo we've
+  // already identified from another session.
   const repoCache = new Map<string, string | null>();
+  const knownRepos = new Set(listKnownRepos(db));
   const resolveRepo = (cwd: string | null): string | null => {
     if (!cwd) return null;
-    if (!repoCache.has(cwd)) {
-      repoCache.set(cwd, fs.existsSync(cwd) ? repoKey(cwd) ?? cwd : cwd);
-    }
-    return repoCache.get(cwd) ?? null;
+    const cached = repoCache.get(cwd);
+    if (cached !== undefined) return cached;
+    const resolved = canonicalRepo(cwd, [...knownRepos]);
+    repoCache.set(cwd, resolved);
+    if (resolved) knownRepos.add(resolved);
+    return resolved;
   };
+
+  // A stored shape older than INGEST_VERSION gets healed in place (instant) and then re-ingested
+  // (thorough) — the heal is what keeps scoped lookups working while the re-read is in flight.
+  const reingest = opts.force || ingestVersionChanged(db);
+  if (ingestVersionChanged(db)) {
+    healRepoAttribution(db, (repo) => resolveRepo(repo));
+    healNoteSessions(db);
+    clearAllIngestCursors(db);
+    markIngestVersion(db);
+  }
 
   let sessions = 0;
   let events = 0;
@@ -109,7 +167,7 @@ export async function backfill(
     );
     const unitMtime = Math.max(0, ...mtimes);
     if (unitMtime === 0) continue;
-    if (!opts.force && getIngestedMtime(db, file) === unitMtime) continue;
+    if (!reingest && getIngestedMtime(db, file) === unitMtime) continue;
 
     const parsed = await parseAny(ref);
     const subs: { ref: SubagentRef; parsed: ParsedTranscript }[] = await Promise.all(
@@ -126,18 +184,53 @@ export async function backfill(
       continue;
     }
 
-    let framingVec: number[] | null = null;
-    if (parsed.framing) {
-      framingVec = await embedOne(framingText(parsed.title, parsed.framing).slice(0, FRAMING_MAX_CHARS));
-    }
+    // One ingest stream per source file: the parent transcript, plus each subagent file.
+    // Transcripts only ever grow, so a stream whose stored rows are still a prefix of what we
+    // just parsed needs only its tail written — the alternative (wipe the session, rewrite
+    // every row, re-embed) rewrote whole 20k-message sessions every watch cycle.
+    const streams: IngestStream[] = [
+      { path: file, parsed, agent: null },
+      ...subs.map((s) => ({ path: s.ref.path, parsed: s.parsed, agent: s.ref.agentType })),
+    ];
+    const cursors = streams.map((s) => getIngestCursor(db, s.path));
+    const appendable = !reingest && cursors.every((c, i) => c !== undefined && isPrefixOf(c, streams[i].parsed));
+
+    const newFraming = parsed.framing ? framingText(parsed.title, parsed.framing) : null;
+    const storedFraming = getFramingText(db, parsed.sessionId);
+    const framingChanged = newFraming !== null && newFraming !== storedFraming;
+    // Embedding is model inference — only pay it when the framing text actually changed.
+    const framingVec = framingChanged ? await embedOne(newFraming.slice(0, FRAMING_MAX_CHARS)) : null;
+
     const first = parsed.toolEvents[0];
+    const host = ref.kind;
+    const messageRepo = resolveRepo(parsed.cwd ?? first?.cwd ?? null);
 
     const apply = db.transaction(() => {
-      deleteSession(db, parsed.sessionId);
+      upsertSessionCard(db, {
+        session: parsed.sessionId,
+        title: parsed.title ?? deriveTitle(parsed.framing),
+        host,
+        repo: messageRepo,
+        branch: first?.branch ?? parsed.messages[0]?.branch ?? null,
+        cwd: parsed.cwd ?? first?.cwd ?? null,
+      });
+      if (!appendable) deleteSession(db, parsed.sessionId, { keepFraming: !framingChanged });
 
-      const host = ref.kind;
-      const insertEvents = (p: ParsedTranscript, agent: string | null) => {
-        for (const e of p.toolEvents) {
+      for (const [i, stream] of streams.entries()) {
+        const from: IngestCursor = appendable
+          ? (cursors[i] as IngestCursor)
+          : { msgCount: 0, evCount: 0, lastTs: null, lastId: null };
+
+        // The newest turn is not final: hosts stream a message in chunks that merge into one
+        // row, so the last message we stored may have grown rather than been superseded.
+        if (appendable && from.lastId !== null && from.msgCount > 0) {
+          const latest = stream.parsed.messages[from.msgCount - 1];
+          if (latest && getMessageText(db, from.lastId) !== latest.text) {
+            updateMessageText(db, from.lastId, latest.text);
+          }
+        }
+
+        for (const e of stream.parsed.toolEvents.slice(from.evCount)) {
           insertToolEvent(db, {
             session: parsed.sessionId,
             repo: resolveRepo(e.cwd),
@@ -147,16 +240,14 @@ export async function backfill(
             file: e.file,
             command: e.command,
             ts: e.timestamp,
-            agent,
+            agent: stream.agent,
             host,
           });
           events++;
         }
-      };
-      const insertMessages = (p: ParsedTranscript) => {
-        for (const m of p.messages) {
-          const repo = resolveRepo(first?.cwd ?? null);
-          insertMessage(db, {
+        let lastId = from.lastId;
+        for (const m of stream.parsed.messages.slice(from.msgCount)) {
+          lastId = insertMessage(db, {
             session: parsed.sessionId,
             ts: m.timestamp,
             branch: m.branch,
@@ -165,32 +256,38 @@ export async function backfill(
             agentId: m.agentId,
             text: m.text,
             host,
-            repo,
+            repo: messageRepo,
           });
         }
-      };
 
-      insertEvents(parsed, null);
-      insertMessages(parsed);
-      for (const s of subs) {
-        insertEvents(s.parsed, s.ref.agentType);
-        insertMessages(s.parsed);
+        const msgs = stream.parsed.messages;
+        setIngestCursor(db, stream.path, unitMtime, {
+          msgCount: msgs.length,
+          evCount: stream.parsed.toolEvents.length,
+          lastTs: msgs.length ? msgs[msgs.length - 1].timestamp : null,
+          lastId,
+        });
       }
 
-      if (framingVec && parsed.framing) {
+      // Even when the framing text is unchanged (so we skip re-embedding), its scope columns
+      // may have just been corrected — keep the vector, refresh the attribution.
+      db.prepare(`UPDATE embeddings SET repo = @repo, host = @host WHERE session = @session AND kind = 'framing'`)
+        .run({ repo: messageRepo, host, session: parsed.sessionId });
+
+      if (framingVec && newFraming) {
+        db.prepare(`DELETE FROM embeddings WHERE session = ? AND kind = 'framing'`).run(parsed.sessionId);
         insertEmbedding(db, {
           session: parsed.sessionId,
-          repo: resolveRepo(first?.cwd ?? null),
+          repo: messageRepo,
           branch: first?.branch ?? null,
           kind: "framing",
-          text: framingText(parsed.title, parsed.framing),
+          text: newFraming,
           vector: framingVec,
           ts: parsed.userTurns[0]?.timestamp ?? new Date().toISOString(),
           host,
         });
         embeddings++;
       }
-      setIngested(db, file, unitMtime);
     });
     apply();
     sessions++;

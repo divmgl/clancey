@@ -270,15 +270,48 @@ describe("grepTurns", () => {
     assert.equal(hits[0].agent, "Explore");
   });
 
-  test("matches any term and ranks turns hitting more of them first (OR semantics)", () => {
+  test("requires every term when something matches all of them", () => {
     msg({ session: "s1", ts: "t1", branch: null, text: "effort and difficulty together" });
     msg({ session: "s2", ts: "t2", branch: null, text: "effort alone" });
     msg({ session: "s3", ts: "t3", branch: null, text: "nothing relevant here" });
-    // Both s1 and s2 surface (a missing word doesn't wipe results); s1 ranks first.
+    // s2 has only one of the two words — it is noise next to s1, not a result.
     assert.deepEqual(
       grepTurns(db, "effort difficulty").map((h) => h.session),
-      ["s1", "s2"],
+      ["s1"],
     );
+  });
+
+  test("falls back to any-term matching when no turn has them all", () => {
+    msg({ session: "s1", ts: "t1", branch: null, text: "effort alone" });
+    msg({ session: "s2", ts: "t2", branch: null, text: "nothing relevant here" });
+    assert.deepEqual(
+      grepTurns(db, "effort difficulty").map((h) => h.session),
+      ["s1"],
+    );
+  });
+
+  test("ignores stopwords so common filler cannot outrank the real term", () => {
+    msg({ session: "s1", ts: "t1", branch: null, text: "the migration of the schema" });
+    msg({ session: "s2", ts: "t2", branch: null, text: "we have the answer in the box" });
+    assert.deepEqual(
+      grepTurns(db, "what is the migration").map((h) => h.session),
+      ["s1"],
+    );
+  });
+
+  test("caps hits from a single chatty session", () => {
+    for (let i = 0; i < 5; i++) msg({ session: "loud", ts: `t${i}`, branch: null, text: "widget rewrite notes" });
+    msg({ session: "quiet", ts: "t9", branch: null, text: "widget rewrite plan" });
+    const hits = grepTurns(db, "widget rewrite");
+    assert.equal(hits.filter((h) => h.session === "loud").length, 2);
+    assert.ok(hits.some((h) => h.session === "quiet"));
+  });
+
+  test("shows the turn that followed the match", () => {
+    msg({ session: "s1", ts: "t1", branch: null, role: "user", text: "why did we drop the queue?" });
+    msg({ session: "s1", ts: "t2", branch: null, role: "assistant", text: "because redis was already durable" });
+    const [hit] = grepTurns(db, "drop the queue");
+    assert.match(hit.reply ?? "", /redis was already durable/);
   });
 
   test("sanitizes punctuation and FTS operators instead of throwing", () => {

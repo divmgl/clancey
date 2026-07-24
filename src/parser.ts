@@ -49,6 +49,8 @@ export interface ParsedTranscript {
   messages: ConvMessage[];
   /** First substantive human turn — the session's framing, used as a search anchor. */
   framing: string | null;
+  /** Working directory the session ran in, even when it recorded no tool events. */
+  cwd: string | null;
 }
 
 /** Attribution + identity overrides used when a transcript is a subagent of a parent session. */
@@ -387,6 +389,7 @@ export async function parseTranscript(filePath: string, attribution?: ParseAttri
   const userTurns: UserTurn[] = [];
   const messages: ConvMessage[] = [];
   let title: string | null = null;
+  let sessionCwd: string | null = null;
 
   const rl = readline.createInterface({
     input: fs.createReadStream(filePath),
@@ -415,6 +418,7 @@ export async function parseTranscript(filePath: string, attribution?: ParseAttri
 
     const branch = typeof obj.gitBranch === "string" ? obj.gitBranch : null;
     const cwd = typeof obj.cwd === "string" ? obj.cwd : null;
+    if (cwd && !sessionCwd) sessionCwd = cwd;
     const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "";
 
     if (obj.type === "assistant") {
@@ -445,7 +449,7 @@ export async function parseTranscript(filePath: string, attribution?: ParseAttri
     }
   }
 
-  return { sessionId, title, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };
+  return { sessionId, title, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null, cwd: sessionCwd };
 }
 
 /** Codex command tools, across versions: `shell` (array cmd), `exec_command`/`shell_command` (string cmd). */
@@ -601,7 +605,15 @@ export async function parseCodexTranscript(filePath: string): Promise<ParsedTran
     if (parsed.message) messages.push(parsed.message);
   }
 
-  return { sessionId, title: null, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };
+  return {
+    sessionId,
+    title: null,
+    toolEvents,
+    userTurns,
+    messages,
+    framing: userTurns[0]?.text ?? null,
+    cwd: state.cwd,
+  };
 }
 
 /** OpenCode tools that touch a file (its input carries `filePath`). */
@@ -740,7 +752,7 @@ export async function parseOpencodeTranscript(sessionFile: string): Promise<Pars
     if (text) messages.push({ role, agent: null, agentId: null, branch: null, timestamp, text });
   }
 
-  return { sessionId, title, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null };
+  return { sessionId, title, toolEvents, userTurns, messages, framing: userTurns[0]?.text ?? null, cwd };
 }
 
 /** Parse any transcript by kind. */
@@ -891,6 +903,7 @@ export async function parseHermesTranscript(refPath: string): Promise<ParsedTran
     userTurns: [],
     messages: [],
     framing: null,
+    cwd: null,
   };
   if (!sessionId || !fs.existsSync(dbPath)) return empty;
 
@@ -1011,6 +1024,7 @@ export async function parseHermesTranscript(refPath: string): Promise<ParsedTran
       userTurns,
       messages,
       framing: userTurns[0]?.text ?? null,
+      cwd,
     };
   } catch {
     return empty;
@@ -1188,6 +1202,16 @@ export async function parseGrokTranscript(
   } catch {
     // missing/corrupt summary — parse updates alone
   }
+  // Grok groups sessions under a URL-encoded cwd, so the path itself carries the repo even
+  // when summary.json is missing or was written before cwd was recorded.
+  if (!cwd) {
+    try {
+      const decoded = decodeURIComponent(path.basename(path.dirname(sessionDir)));
+      if (decoded.startsWith("/")) cwd = decoded;
+    } catch {
+      // not an encoded path — leave cwd null
+    }
+  }
 
   const toolEvents: ToolEvent[] = [];
   const userTurns: UserTurn[] = [];
@@ -1220,7 +1244,7 @@ export async function parseGrokTranscript(
 
   const updatesPath = path.join(sessionDir, "updates.jsonl");
   if (!fs.existsSync(updatesPath)) {
-    return { sessionId, title, toolEvents, userTurns, messages, framing: null };
+    return { sessionId, title, toolEvents, userTurns, messages, framing: null, cwd };
   }
 
   const rl = readline.createInterface({
@@ -1322,5 +1346,6 @@ export async function parseGrokTranscript(
     userTurns,
     messages,
     framing: userTurns[0]?.text ?? null,
+    cwd,
   };
 }

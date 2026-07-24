@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { openStore } from "./store.js";
+import { openStore, checkpointWal } from "./store.js";
 import { backfill } from "./setup.js";
 import { configureLogger, log, logError, setConsoleSilent } from "./logger.js";
 import { listLiveMcpClients } from "./mcp-clients.js";
@@ -44,10 +44,26 @@ export async function defaultWatchIngest(dbPath: string): Promise<{ sessions: nu
   const db = openStore(dbPath);
   try {
     const stats = await backfill(db, { force: false });
+    maybeCheckpoint(db);
     return { sessions: stats.sessions };
   } finally {
     db.close();
   }
+}
+
+/**
+ * The watcher is the only steady writer, so it owns WAL upkeep. MCP clients hold read
+ * connections open indefinitely, which starves the auto-checkpointer; without this the WAL
+ * grows without bound (309 MB observed against an 831 MB db).
+ */
+const CHECKPOINT_EVERY_MS = 60_000;
+let lastCheckpoint = 0;
+
+function maybeCheckpoint(db: ReturnType<typeof openStore>): void {
+  if (Date.now() - lastCheckpoint < CHECKPOINT_EVERY_MS) return;
+  lastCheckpoint = Date.now();
+  const result = checkpointWal(db);
+  if (result === "busy") log("watch checkpoint: busy (readers active), retrying next cycle");
 }
 
 async function defaultIngest(dbPath: string): Promise<{ sessions: number }> {

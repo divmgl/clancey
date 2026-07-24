@@ -68,6 +68,61 @@ export function remoteShortKey(cwd: string): string | null {
   return null;
 }
 
+/**
+ * Comparison form for a repo name: case- and separator-insensitive. Lets `fifthdoor/gaia`,
+ * `fifthdoor-gaia` (Grok worktree dirs) and `Fifthdoor/Gaia` all land on one key.
+ */
+export function slugRepo(s: string): string {
+  return s.toLowerCase().replace(/\.git$/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+/** The name-ish forms of a stored repo key, for loose matching: full key, basename, slug. */
+export function repoAliases(key: string): string[] {
+  const base = key.includes("/") ? key.slice(key.lastIndexOf("/") + 1) : key;
+  const short = key.startsWith("/") ? null : key;
+  return [...new Set([key, base, short, slugRepo(key), slugRepo(base)].filter(Boolean) as string[])];
+}
+
+/**
+ * Canonical key for the repository a session ran in: `owner/name` when a remote is known,
+ * otherwise the repo root path. Everything about a repo — main checkout, linked worktree,
+ * subdirectory, and both URL forms of its remote — must collapse to this one value, or scope
+ * filters silently return nothing and agents fall back to grepping disk.
+ *
+ * Directories that no longer exist (throwaway worktrees are the common case) can't be asked;
+ * we walk up to the nearest surviving ancestor, and failing that match path segments against
+ * repos we already know by slug (`…/worktrees/fifthdoor-gaia/…` → `fifthdoor/gaia`).
+ */
+export function canonicalRepo(cwd: string | null, knownKeys: readonly string[] = []): string | null {
+  if (!cwd) return null;
+  const abs = cwd.startsWith("~") ? path.join(process.env.HOME || "", cwd.slice(1)) : cwd;
+
+  for (let dir = abs; ; dir = path.dirname(dir)) {
+    if (fs.existsSync(dir)) {
+      const root = repoKey(dir);
+      if (root) return remoteShortKey(root) ?? root;
+      break;
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+
+  const bySlug = new Map<string, string>();
+  for (const key of knownKeys) {
+    for (const alias of repoAliases(key)) bySlug.set(slugRepo(alias), key);
+  }
+  const segments = abs.split("/").filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const hit = bySlug.get(slugRepo(segments[i]));
+    if (hit) return hit;
+    if (i > 0) {
+      const pair = bySlug.get(slugRepo(`${segments[i - 1]}/${segments[i]}`));
+      if (pair) return pair;
+    }
+  }
+
+  return abs;
+}
+
 /** True when `s` looks like a short remote key (owner/name), not a filesystem path. */
 export function looksLikeRemoteShortKey(s: string): boolean {
   if (!s || s.startsWith("/") || s.startsWith("~") || /^[A-Za-z]:[\\/]/.test(s)) return false;
@@ -116,6 +171,16 @@ export function expandRepoFilterKeys(
       // Also accept exact short-key rows already stored as owner/name.
       if (known === raw) keys.add(known);
     }
+  }
+
+  // Loose name match against what's actually stored. Agents ask for `gaia`, `fifthdoor/gaia`
+  // and `/Users/me/dev/gaia` interchangeably; all three should reach the same rows, and a bare
+  // name should never be the reason a lookup comes back empty.
+  const wanted = new Set([slugRepo(raw), ...[...keys].map(slugRepo)]);
+  wanted.delete("");
+  for (const known of knownRepos) {
+    if (!known || keys.has(known)) continue;
+    if (repoAliases(known).some((alias) => wanted.has(slugRepo(alias)))) keys.add(known);
   }
 
   return [...keys];

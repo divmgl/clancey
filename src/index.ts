@@ -13,7 +13,7 @@ import {
   noteText,
   noteEmbedInput,
   recall,
-  search,
+  hybridSearch,
   grepTurns,
   listRecentSessions,
   getMessages,
@@ -39,9 +39,104 @@ import { startCodexLiveCapture } from "./codex-live.js";
 import { registerMcpClient, heartbeatMcpClient, unregisterMcpClient } from "./mcp-clients.js";
 import { ensureWatchRunning, runWatchCli } from "./watch.js";
 import { resolveClanceyDir, resolveDbPath } from "./paths.js";
+import { inferCaller } from "./caller.js";
 
 const EMPTY_LOOKUP_HINT =
-  "No matches. If this work just happened or a recent session is missing, call refresh_index (or run `clancey backfill`) and try again.";
+  "No matches — the index was re-checked for new transcripts before answering. Broaden before giving up: fewer or shorter keywords, drop repo/branch/host, or grep_turns for literal wording.";
+
+/**
+ * Lookups that come back empty re-ingest once and retry, because "nothing found" and "your last
+ * hour of work isn't indexed yet" are indistinguishable to the caller — and the second one sent
+ * agents off to grep transcripts on disk. Throttled: with the watcher polling every few seconds
+ * this is almost always a no-op stat sweep, but it must never become a per-call cost.
+ */
+const AUTO_REFRESH_THROTTLE_MS = 30_000;
+let lastAutoRefresh = 0;
+
+async function withAutoRefresh<T>(
+  db: Store,
+  run: () => { rows: T[]; note: string },
+): Promise<{ rows: T[]; note: string }> {
+  const first = run();
+  if (first.rows.length > 0) return first;
+  const now = Date.now();
+  if (now - lastAutoRefresh < AUTO_REFRESH_THROTTLE_MS) return first;
+  lastAutoRefresh = now;
+  try {
+    await backfill(db, { force: false });
+  } catch (err) {
+    logError("auto-refresh before empty result failed", err);
+    return first;
+  }
+  const retried = run();
+  if (retried.rows.length === 0) return first;
+  return { rows: retried.rows, note: `${retried.note}\n\n(found after refreshing the index)` };
+}
+
+/**
+ * Move the caller's own conversation to the bottom of its own results. Agents kept treating a
+ * top hit that echoed their current prompt as proof the index only knew about themselves. The
+ * rows stay — hiding a session the user might be asking about would be worse.
+ */
+function demoteCurrentSession<T extends { session?: string | null }>(rows: T[], current: string | null): T[] {
+  if (!current) return rows;
+  const mine = rows.filter((r) => r.session === current);
+  return mine.length === 0 || mine.length === rows.length ? rows : [...rows.filter((r) => r.session !== current), ...mine];
+}
+
+/**
+ * Re-run a lookup with the guessed scope filters peeled off when they are what emptied it.
+ *
+ * Agents guess `repo` (and to a lesser extent `branch`) from context and get the spelling wrong
+ * constantly; an empty result reads to them as "the index has nothing", and they go grep disk.
+ * A labelled wider result is strictly more useful than a confident nothing — the caller can see
+ * the filter was dropped and judge the rows itself.
+ */
+function widenIfEmpty<T, S extends { repos?: string[]; branch?: string }>(
+  scope: S,
+  run: (scope: S) => T[],
+): { rows: T[]; note: string } {
+  const rows = run(scope);
+  if (rows.length > 0) return { rows, note: "" };
+  const repo = scope.repos?.[0];
+
+  if (repo) {
+    const wider = run({ ...scope, repos: undefined });
+    if (wider.length > 0) {
+      return { rows: wider, note: `\n\n(no match in repo ${repo} — showing all repos)` };
+    }
+    if (scope.branch) {
+      const bare = run({ ...scope, repos: undefined, branch: undefined });
+      if (bare.length > 0) {
+        return {
+          rows: bare,
+          note: `\n\n(no match in repo ${repo} on branch ${scope.branch} — showing all repos and branches)`,
+        };
+      }
+    }
+    return { rows, note: "" };
+  }
+
+  if (scope.branch) {
+    const wider = run({ ...scope, branch: undefined });
+    if (wider.length > 0) {
+      return { rows: wider, note: `\n\n(no match on branch ${scope.branch} — showing all branches)` };
+    }
+  }
+  return { rows, note: "" };
+}
+
+/** read_turns window: enough to reason over, small enough that no host has to spill it to disk. */
+const DEFAULT_TURN_CHARS = 60_000;
+const MAX_TURN_CHARS = 200_000;
+/** Turns of lead-in kept before an `around` timestamp so a hit lands mid-conversation. */
+const AROUND_CONTEXT_TURNS = 5;
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.trunc(n), min), max);
+}
 
 function getServerVersion(): string {
   try {
@@ -56,15 +151,23 @@ function text(s: string) {
   return { content: [{ type: "text", text: s }] };
 }
 
+/** recall is a map, not a dump: enough to pick a session, not every path ever touched. */
+const RECALL_FILES_SHOWN = 12;
+const RECALL_SESSIONS_SHOWN = 8;
+
 function formatWorkItems(items: WorkItem[]): string {
   if (items.length === 0) return EMPTY_LOOKUP_HINT;
   return items
     .map((w) => {
       const hostBit = w.hosts.length ? ` · hosts: ${w.hosts.join(", ")}` : "";
+      // Absolute paths for every file a branch ever touched ran to tens of KB per item and
+      // buried the sessions — which are the part a caller can actually act on.
+      const files = w.files.map((f) => (w.repo && f.startsWith("/") ? f.slice(f.lastIndexOf("/") + 1) : f));
+      const shown = [...new Set(files)].slice(0, RECALL_FILES_SHOWN);
       const lines = [
         `### ${w.branch ?? "(no branch)"}  ·  ${w.repo ?? "(no repo)"}${hostBit}`,
-        `- sessions: ${w.sessions.join(", ") || "(none)"}`,
-        `- files (${w.files.length}): ${w.files.slice(0, 30).join(", ")}${w.files.length > 30 ? ", …" : ""}`,
+        `- sessions: ${w.sessions.slice(0, RECALL_SESSIONS_SHOWN).join(", ") || "(none)"}${w.sessions.length > RECALL_SESSIONS_SHOWN ? ` (+${w.sessions.length - RECALL_SESSIONS_SHOWN} more)` : ""}`,
+        `- files (${w.files.length}): ${shown.join(", ")}${files.length > shown.length ? ", …" : ""}`,
         `- ${w.toolEventCount} tool events · ${w.firstTs} → ${w.lastTs}`,
       ];
       if (w.decisions.length) {
@@ -86,43 +189,58 @@ function formatWorkItems(items: WorkItem[]): string {
     .join("\n\n");
 }
 
-/** Below this top cosine score, `search` nudges the agent toward the keyword fallback. */
-const LOW_CONFIDENCE = 0.45;
-
 /** Label a hit by who said it: `user`, `assistant`, or `assistant·Plan` for a subagent. */
 function speaker(h: TurnHit): string {
   const role = h.role || "?";
   return h.agent ? `${role}·${h.agent}` : role;
 }
 
-function formatTurnHits(hits: TurnHit[]): string {
+function formatTurnHits(hits: TurnHit[], current: string | null = null): string {
   if (hits.length === 0) return EMPTY_LOOKUP_HINT;
   return hits
     .map((h, i) => {
       const host = h.host ? ` host=${h.host}` : "";
-      return `${i + 1}. (${h.branch ?? "?"}) [${speaker(h)}] session=${h.session}${host} · ${h.ts}\n   ${h.snippet.replace(/\s+/g, " ").trim()}`;
+      const title = h.title ? ` "${h.title}"` : "";
+      const reply = h.reply ? `\n   ↳ ${h.reply}` : "";
+      const self = h.session === current ? " (this conversation)" : "";
+      return `${i + 1}. (${h.branch ?? "?"}) [${speaker(h)}] session=${h.session}${title}${host}${self} · ${h.ts}\n   ${h.snippet.replace(/\s+/g, " ").trim()}${reply}`;
     })
     .join("\n\n");
 }
 
-function formatSearchHits(hits: SearchHit[]): string {
+function formatSearchHits(hits: SearchHit[], current: string | null = null): string {
   if (hits.length === 0) return EMPTY_LOOKUP_HINT;
   return hits
     .map((h, i) => {
       const host = h.host ? `, ${h.host}` : "";
       const sess = h.session ? ` session=${h.session}` : "";
-      return `${i + 1}. [${h.score.toFixed(3)}] (${h.branch ?? "?"}, ${h.kind}${host})${sess}\n   ${h.text.replace(/\s+/g, " ").slice(0, 280)}`;
+      const title = h.title ? ` "${h.title}"` : "";
+      const self = h.session && h.session === current ? " (this conversation)" : "";
+      return `${i + 1}. [${h.matched.join("+")}] (${h.branch ?? "?"}, ${h.kind}${host})${sess}${title}${self}\n   ${h.text.replace(/\s+/g, " ").slice(0, 280)}`;
     })
     .join("\n\n");
 }
 
-function formatSessions(rows: SessionSummary[]): string {
+/** Human-readable stored size, so a caller can see a 12 MB session before asking to read it. */
+function formatBytes(bytes: number): string {
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  if (bytes >= 1_000) return `${Math.round(bytes / 1_000)} KB`;
+  return `${bytes} B`;
+}
+
+function formatSessions(rows: SessionSummary[], current: string | null = null): string {
   if (rows.length === 0) return EMPTY_LOOKUP_HINT;
   return rows
-    .map(
-      (s, i) =>
-        `${i + 1}. session=${s.session} host=${s.host ?? "?"} repo=${s.repo ?? "?"} branch=${s.branch ?? "?"} · ${s.firstTs} → ${s.lastTs}`,
-    )
+    .map((s, i) => {
+      const title = s.title ? `"${s.title}"` : "(untitled)";
+      const size = s.turns ? ` · ${s.turns} turns, ${formatBytes(s.bytes)}` : "";
+      const self = s.session === current ? " (this conversation)" : "";
+      return (
+        `${i + 1}. ${title}${self}\n` +
+        `   session=${s.session} host=${s.host ?? "?"} repo=${s.repo ?? "?"} branch=${s.branch ?? "?"}${size}\n` +
+        `   ${s.firstTs} → ${s.lastTs}`
+      );
+    })
     .join("\n");
 }
 
@@ -178,7 +296,7 @@ function buildServer(db: Store): Server {
       {
         name: "search",
         description:
-          "Semantic search over session framings and recorded decisions/learnings, ranked by similarity. Scope with repo/branch/host/time. If it misses, fall back to grep_turns.",
+          "Search past conversations by meaning and by wording at once — session framings, recorded decisions/learnings, and the full verbatim turn text, fused into one ranking. Scope with repo/branch/host/time. Start here for topics; use grep_turns when you need an exact phrase.",
         inputSchema: {
           type: "object",
           properties: {
@@ -221,12 +339,22 @@ function buildServer(db: Store): Server {
       {
         name: "read_turns",
         description:
-          "Read the full verbatim conversation from a session (main + subagents, labeled by speaker). Optionally only the branch slice. If the live transcript was pruned, serves the stored snapshot.",
+          "Read the verbatim conversation from a session (main + subagents, labeled by speaker), a window at a time. Optionally only the branch slice. If the live transcript was pruned, serves the stored snapshot. Long sessions come back paginated — the header says how to fetch the next window.",
         inputSchema: {
           type: "object",
           properties: {
             session: { type: "string", description: "Session id" },
             branch: { type: "string", description: "Only turns recorded on this branch" },
+            offset: { type: "number", description: "Start at this turn index (0-based); use the offset from the previous response's More: line" },
+            limit: { type: "number", description: "Max turns to return in this window" },
+            around: {
+              type: "string",
+              description: "ISO timestamp to center on — e.g. the ts of a grep_turns hit — returning that turn with a few before it",
+            },
+            max_chars: {
+              type: "number",
+              description: `Character budget for this window (default ${DEFAULT_TURN_CHARS}, max ${MAX_TURN_CHARS})`,
+            },
           },
           required: ["session"],
         },
@@ -342,10 +470,13 @@ function buildServer(db: Store): Server {
         case "record_decision": {
           const decision = args.decision as string;
           if (!decision) return { ...text("Error: decision is required"), isError: true };
-          const repo = (args.repo as string) ?? null;
-          const branch = (args.branch as string) ?? null;
-          const session = (args.session as string) ?? null;
-          const host = normalizeHost(args.host as string | undefined);
+          // Anchor the note to the conversation that produced it even when the agent forgets to
+          // pass it: an unanchored note shows up in search with nothing to read back.
+          const caller = inferCaller(db);
+          const repo = (args.repo as string) ?? caller.repo;
+          const branch = (args.branch as string) ?? caller.branch;
+          const session = (args.session as string) ?? caller.session;
+          const host = normalizeHost(args.host as string | undefined) ?? caller.host;
           const why = (args.why as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
@@ -398,10 +529,13 @@ function buildServer(db: Store): Server {
         case "record_learning": {
           const learning = args.learning as string;
           if (!learning) return { ...text("Error: learning is required"), isError: true };
-          const repo = (args.repo as string) ?? null;
-          const branch = (args.branch as string) ?? null;
-          const session = (args.session as string) ?? null;
-          const host = normalizeHost(args.host as string | undefined);
+          // Anchor the note to the conversation that produced it even when the agent forgets to
+          // pass it: an unanchored note shows up in search with nothing to read back.
+          const caller = inferCaller(db);
+          const repo = (args.repo as string) ?? caller.repo;
+          const branch = (args.branch as string) ?? caller.branch;
+          const session = (args.session as string) ?? caller.session;
+          const host = normalizeHost(args.host as string | undefined) ?? caller.host;
           const context = (args.context as string) ?? null;
           const files = (args.files as string[]) ?? null;
           const ts = new Date().toISOString();
@@ -467,11 +601,10 @@ function buildServer(db: Store): Server {
             exclude_sessions: args.exclude_sessions,
             ...time.filter,
           });
-          const items = recall(db, {
-            ...scope,
-            file: args.file as string | undefined,
-          });
-          return text(formatWorkItems(items));
+          const { rows: items, note } = await withAutoRefresh(db, () =>
+            widenIfEmpty(scope, (s) => recall(db, { ...s, file: args.file as string | undefined })),
+          );
+          return text(formatWorkItems(items) + note);
         }
         case "search": {
           const query = args.query as string;
@@ -492,13 +625,12 @@ function buildServer(db: Store): Server {
             exclude_sessions: args.exclude_sessions,
             ...time.filter,
           });
-          const hits = search(db, vector, scope);
-          let out = formatSearchHits(hits);
-          const top = hits[0]?.score ?? 0;
-          if (hits.length > 0 && top < LOW_CONFIDENCE) {
-            out += `\n\n(low confidence — top score ${top.toFixed(3)}. For literal wording, try grep_turns({ query }) — keyword search over the raw conversation.)`;
-          }
-          return text(out);
+          const caller = inferCaller(db);
+          const { rows: found, note } = await withAutoRefresh(db, () =>
+            widenIfEmpty(scope, (s) => hybridSearch(db, query, vector, s)),
+          );
+          const hits = demoteCurrentSession(found, caller.session);
+          return text(formatSearchHits(hits, caller.session) + note);
         }
         case "grep_turns": {
           const query = args.query as string;
@@ -518,7 +650,11 @@ function buildServer(db: Store): Server {
             exclude_sessions: args.exclude_sessions,
             ...time.filter,
           });
-          return text(formatTurnHits(grepTurns(db, query, scope)));
+          const caller = inferCaller(db);
+          const { rows: found, note } = await withAutoRefresh(db, () =>
+            widenIfEmpty(scope, (s) => grepTurns(db, query, s)),
+          );
+          return text(formatTurnHits(demoteCurrentSession(found, caller.session), caller.session) + note);
         }
         case "list_sessions": {
           const time = resolveTimeFilter({
@@ -536,7 +672,11 @@ function buildServer(db: Store): Server {
             exclude_sessions: args.exclude_sessions,
             ...time.filter,
           });
-          return text(formatSessions(listRecentSessions(db, scope)));
+          const caller = inferCaller(db);
+          const { rows, note } = await withAutoRefresh(db, () =>
+            widenIfEmpty(scope, (s) => listRecentSessions(db, s)),
+          );
+          return text(formatSessions(rows, caller.session) + note);
         }
         case "refresh_index": {
           const force = Boolean(args.force);
@@ -590,11 +730,40 @@ function buildServer(db: Store): Server {
               `No turns${branch ? ` on branch ${branch}` : ""} found for session ${session}. ${EMPTY_LOOKUP_HINT}`,
             );
           }
-          const note = pruned ? "\n(transcript pruned; served from snapshot)" : "";
-          const header = `Session ${session}${branch ? ` (branch ${branch})` : ""} — ${turns.length} turns${title ? `\nTitle: ${title}` : ""}${note}`;
+
+          // Sessions run to megabytes. Returning one whole is what pushed agents into dumping
+          // the response to a file and grepping it — so serve a window and say how to get more.
+          const maxChars = clampNumber(args.max_chars, DEFAULT_TURN_CHARS, 1_000, MAX_TURN_CHARS);
+          let start = clampNumber(args.offset, 0, 0, turns.length - 1);
+          if (typeof args.around === "string" && args.around.trim()) {
+            const target = args.around.trim();
+            const idx = turns.findIndex((t) => t.timestamp >= target);
+            start = Math.max(0, (idx === -1 ? turns.length - 1 : idx) - AROUND_CONTEXT_TURNS);
+          }
+          const maxTurns = clampNumber(args.limit, turns.length, 1, turns.length);
+
           const label = (t: Turn) => (t.agent ? `${t.role}·${t.agent}` : t.role);
-          const body = turns.map((t) => `--- ${t.timestamp} [${label(t)}] ---\n${t.text}`).join("\n\n");
-          return text(`${header}\n\n${body}`);
+          const chunks: string[] = [];
+          let used = 0;
+          let end = start;
+          while (end < turns.length && end - start < maxTurns) {
+            const t = turns[end];
+            const chunk = `--- ${t.timestamp} [${label(t)}] ---\n${t.text}`;
+            // Always emit at least one turn, even if that single turn blows the budget.
+            if (used + chunk.length > maxChars && chunks.length > 0) break;
+            chunks.push(chunk);
+            used += chunk.length + 2;
+            end++;
+          }
+
+          const pruneNote = pruned ? "\n(transcript pruned; served from snapshot)" : "";
+          const range = `turns ${start + 1}-${end} of ${turns.length}`;
+          const more =
+            end < turns.length
+              ? `\nMore: read_turns({ session: "${session}", offset: ${end}${branch ? `, branch: "${branch}"` : ""} })`
+              : "";
+          const header = `Session ${session}${branch ? ` (branch ${branch})` : ""} — ${range}${title ? `\nTitle: ${title}` : ""}${pruneNote}${more}`;
+          return text(`${header}\n\n${chunks.join("\n\n")}`);
         }
         default:
           return { ...text(`Unknown tool: ${name}`), isError: true };
