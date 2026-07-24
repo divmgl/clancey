@@ -1,5 +1,5 @@
 import fs from "fs";
-import { repoKey, currentBranch } from "./git.js";
+import { canonicalRepo, currentBranch } from "./git.js";
 import { openStore, insertToolEvent, normalizeHost, type Host } from "./store.js";
 import { upgradeNotice } from "./upgrade.js";
 import { logError } from "./logger.js";
@@ -136,7 +136,9 @@ export async function runHook(): Promise<void> {
 
   const cwd = payload.cwd ?? process.cwd();
   const session = payload.session_id ?? "";
-  const repo = repoKey(cwd);
+  // Canonical `owner/name`, same as backfill derives. Storing the raw git root here split one
+  // repo across two keys until a re-read folded it in, and left worktrees as repos of their own.
+  const repo = canonicalRepo(cwd);
   const branch = currentBranch(cwd);
   const tool = payload.tool_name ?? "";
   const input = payload.tool_input ?? {};

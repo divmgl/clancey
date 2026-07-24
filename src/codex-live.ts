@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { listCodexFiles, parseCodexJsonlLine, type CodexParseState, type ToolEvent } from "./parser.js";
-import { repoKey } from "./git.js";
+import { canonicalRepo } from "./git.js";
 import { insertToolEvent, type Store } from "./store.js";
 import { log, logError } from "./logger.js";
 import { resolveClanceyDir } from "./paths.js";
@@ -45,8 +45,7 @@ function sessionId(file: string): string {
 }
 
 function resolveRepo(cwd: string | null): string | null {
-  if (!cwd) return null;
-  return fs.existsSync(cwd) ? repoKey(cwd) ?? cwd : cwd;
+  return canonicalRepo(cwd);
 }
 
 function insertEvent(db: Store, session: string, event: ToolEvent): void {
