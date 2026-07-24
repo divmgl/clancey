@@ -34,6 +34,8 @@ import {
   setReingestPending,
   healRepoAttribution,
   healNoteSessions,
+  backupStore,
+  INGEST_VERSION,
   CLANCEY_DIR,
 } from "./store.js";
 import {
@@ -53,7 +55,7 @@ import {
 } from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { canonicalRepo } from "./git.js";
-import { setConsoleSilent } from "./logger.js";
+import { setConsoleSilent, log } from "./logger.js";
 
 const tildify = (p: string) => p.replace(os.homedir(), "~");
 
@@ -153,6 +155,11 @@ export async function backfill(
   // been re-ingested still has no cursor, so the next pass picks it up.
   const reingest = opts.force || ingestVersionChanged(db);
   if (ingestVersionChanged(db)) {
+    // Snapshot first: the heal rewrites rows in place and the cursor wipe discards the record of
+    // what was already read, so a bad migration has nothing to roll back to. The copy is also what
+    // you experiment against instead of the live DB.
+    const backup = backupStore(db, `pre-v${INGEST_VERSION}`);
+    if (backup) log(`Backed up database before migration: ${backup}`);
     healRepoAttribution(db, (repo) => resolveRepo(repo));
     healNoteSessions(db);
     clearAllIngestCursors(db);

@@ -4,6 +4,7 @@ import fs from "fs";
 import { vectorToBlob, blobToVector, cosineSimilarity } from "./embeddings.js";
 import { expandRepoFilterKeys } from "./git.js";
 import { resolveClanceyDir, resolveDbPath } from "./paths.js";
+import { logError } from "./logger.js";
 
 /** @deprecated Prefer resolveClanceyDir() — value is resolved at module load. */
 export const CLANCEY_DIR = resolveClanceyDir();
@@ -626,6 +627,56 @@ export function ingestVersionChanged(db: Store): boolean {
 
 export function markIngestVersion(db: Store): void {
   setMeta(db, "ingest_version", String(INGEST_VERSION));
+}
+
+/**
+ * How many migration snapshots to keep. A real index runs to hundreds of megabytes, so this is a
+ * disk budget as much as a retention rule: the pre-migration copy plus the one before it.
+ */
+export const MAX_BACKUPS = 2;
+
+export function backupsDir(dir: string = resolveClanceyDir()): string {
+  return path.join(dir, "backups");
+}
+
+/**
+ * Snapshot the store before a migration rewrites it. A migration heals rows in place and drops
+ * every ingest cursor; if the heal turns out to be wrong, the pre-migration shape is otherwise
+ * unrecoverable — the transcripts it was derived from have already been re-read. The snapshot is
+ * also the safe thing to run experiments against, since the live DB is being written by the
+ * watcher and by every MCP call.
+ *
+ * `VACUUM INTO` takes a consistent copy under WAL without stopping writers, so this is safe to
+ * call on a hot database. Failure is non-fatal: a missing backup must not block the migration.
+ */
+export function backupStore(db: Store, label: string): string | null {
+  const source = db.name;
+  const dir = backupsDir(path.dirname(source));
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.join(dir, `${path.basename(source, ".db")}-${label}-${stamp}.db`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    db.prepare(`VACUUM INTO ?`).run(dest);
+  } catch (err) {
+    logError("database backup failed", err);
+    return null;
+  }
+  pruneBackups(dir);
+  return dest;
+}
+
+/** Keep only the newest MAX_BACKUPS snapshots so migrations don't grow the data dir without bound. */
+function pruneBackups(dir: string): void {
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith(".db"))
+      .map((f) => path.join(dir, f))
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    for (const stale of files.slice(MAX_BACKUPS)) fs.rmSync(stale, { force: true });
+  } catch (err) {
+    logError("backup prune failed", err);
+  }
 }
 
 /** Drop every ingest cursor so the next backfill re-reads all transcripts from scratch. */
