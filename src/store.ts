@@ -619,7 +619,7 @@ export function listKnownRepos(db: Store): string[] {
  * the next backfill drop its cursors and re-read every transcript, so shape fixes reach existing
  * databases on their own — `--force` is a flag nobody remembers to run.
  */
-export const INGEST_VERSION = 4;
+export const INGEST_VERSION = 5;
 
 export function ingestVersionChanged(db: Store): boolean {
   return getMeta(db, "ingest_version") !== String(INGEST_VERSION);

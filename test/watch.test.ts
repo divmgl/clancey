@@ -143,6 +143,35 @@ describe("runWatch supervisor", () => {
   });
 });
 
+describe("watch stop threading (CLA-5)", () => {
+  test("hands ingest a stop signal that goes true, so a scan can abort inside one iteration", async () => {
+    const id = registerMcpClient({ dir });
+    const seen: boolean[] = [];
+    let stopAfter = false;
+    const result = await runWatch({
+      dir,
+      pollMs: 0,
+      clientCheckMs: 0,
+      startGraceMs: 0,
+      maxIterations: 10,
+      sleep: async () => {},
+      // A real ingest is a multi-minute scan; what matters is that it can see the stop request
+      // arrive while it is still running, rather than only between iterations.
+      shouldStop: () => stopAfter,
+      ingest: async (_dbPath, shouldStop) => {
+        assert.equal(typeof shouldStop, "function");
+        seen.push(shouldStop!());
+        stopAfter = true;
+        seen.push(shouldStop!());
+        return { sessions: 0 };
+      },
+    });
+    unregisterMcpClient(id, { dir });
+    assert.equal(result, "exited-empty");
+    assert.deepEqual(seen, [false, true], "the flag must flip under a running ingest");
+  });
+});
+
 describe("incremental ingest path used by watch", () => {
   test("defaultWatchIngest/backfill picks up appended transcript text for grep_turns", async () => {
     // Isolate every host root so we only scan our fixture (not the developer machine).

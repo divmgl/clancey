@@ -2,10 +2,10 @@ import fs from "fs";
 import path from "path";
 import { listCodexFiles, parseCodexJsonlLine, type CodexParseState, type ToolEvent } from "./parser.js";
 import { canonicalRepo } from "./git.js";
-import { insertToolEvent, type Store } from "./store.js";
+import { insertToolEvent, listKnownRepos, type Store } from "./store.js";
 import { log, logError } from "./logger.js";
 import { resolveClanceyDir } from "./paths.js";
-import { isPidAlive } from "./pid.js";
+import { tryClaimPidLock } from "./file-lock.js";
 
 interface FileState {
   offset: number;
@@ -38,28 +38,12 @@ export interface CodexLiveOptions {
   requireLock?: boolean;
   /** Optional pre-claimed release hook (used by startCodexLiveCapture). */
   releaseLock?: () => void;
+  /** Test seam: stand in for `canonicalRepo` so the cache can be observed. */
+  canonicalRepo?: (cwd: string | null, knownKeys: readonly string[]) => string | null;
 }
 
 function sessionId(file: string): string {
   return path.basename(file, ".jsonl");
-}
-
-function resolveRepo(cwd: string | null): string | null {
-  return canonicalRepo(cwd);
-}
-
-function insertEvent(db: Store, session: string, event: ToolEvent): void {
-  insertToolEvent(db, {
-    session,
-    repo: resolveRepo(event.cwd),
-    branch: event.branch,
-    cwd: event.cwd,
-    tool: event.tool,
-    file: event.file,
-    command: event.command,
-    ts: event.timestamp || new Date().toISOString(),
-    host: "codex",
-  });
 }
 
 async function readSlice(file: string, start: number, endExclusive: number): Promise<string> {
@@ -86,48 +70,14 @@ export interface LiveCaptureLock {
 
 /**
  * Claim exclusive ownership of Codex live capture for this store directory.
- * Uses an exclusive lock file with stale-PID recovery so dead owners do not block forever.
+ *
+ * Stale-PID recovery is delegated to `tryClaimPidLock` because the obvious version — read the
+ * PID, see it is dead, unlink, create — is not safe when two processes recover the same stale
+ * lock at once: both see the dead PID, and the slower unlink deletes the winner's brand-new lock,
+ * so both believe they own live capture and double-insert every tool event (CLA-4).
  */
 export function tryClaimCodexLiveLock(lockPath: string): LiveCaptureLock {
-  const noop: LiveCaptureLock = { owned: false, release: () => {} };
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-
-  const makeRelease = (): (() => void) => () => {
-    try {
-      const cur = fs.readFileSync(lockPath, "utf-8").trim();
-      if (cur === String(process.pid)) fs.unlinkSync(lockPath);
-    } catch {
-      // ignore
-    }
-  };
-
-  const tryCreate = (): boolean => {
-    try {
-      fs.writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  if (tryCreate()) return { owned: true, release: makeRelease() };
-
-  // Stale lock from a dead process — reclaim once.
-  try {
-    const existing = Number(fs.readFileSync(lockPath, "utf-8").trim());
-    if (!isPidAlive(existing)) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        return noop;
-      }
-      if (tryCreate()) return { owned: true, release: makeRelease() };
-    }
-  } catch {
-    return noop;
-  }
-
-  return noop;
+  return tryClaimPidLock(lockPath);
 }
 
 export function defaultCodexLiveLockPath(): string {
@@ -172,6 +122,9 @@ export class CodexLiveCapture {
   private running = false;
   private releaseLock: (() => void) | null;
   private active = false;
+  private readonly repoCache = new Map<string, string | null>();
+  private knownRepos: Set<string> | null = null;
+  private repoResolveCount = 0;
 
   constructor(
     private readonly db: Store,
@@ -225,6 +178,54 @@ export class CodexLiveCapture {
   trackedMeta(file: string): CodexParseState | undefined {
     const s = this.states.get(file);
     return s ? { ...s.codex } : undefined;
+  }
+
+  /** Exposed for tests: how many times the cache missed and shelled out to git. */
+  get repoResolutions(): number {
+    return this.repoResolveCount;
+  }
+
+  /**
+   * Canonical repo key for a tool event's cwd, resolved at most once per cwd.
+   *
+   * Uncached, this ran up to three synchronous `git` processes per tool event, on the same thread
+   * that serves MCP tool calls and the stdio transport — a 100-event Codex burst between two 2s
+   * polls blocked the event loop for ~300ms. Codex emits many events from a handful of cwds, so
+   * one entry per cwd removes essentially all of that.
+   *
+   * The cache is per-instance rather than module-level: it is only ever populated by the single
+   * lock-owning capture, and tying its lifetime to the capture means a replacement capture starts
+   * from a fresh view of disk instead of inheriting a previous owner's stale keys. Negative results are cached too — a cwd that is
+   * not a repo today could become one, but re-shelling out on every event for a non-repo cwd is
+   * precisely the cost being removed, and live capture is not the system of record for repo keys
+   * (backfill re-resolves from scratch). Keys learned here feed back into `knownRepos` so a
+   * deleted worktree can still match a repo identified elsewhere, same as backfill.
+   */
+  private resolveRepo(cwd: string | null): string | null {
+    if (!cwd) return null;
+    const cached = this.repoCache.get(cwd);
+    if (cached !== undefined) return cached;
+    if (!this.knownRepos) this.knownRepos = new Set(listKnownRepos(this.db));
+    const resolve = this.opts.canonicalRepo ?? canonicalRepo;
+    this.repoResolveCount++;
+    const resolved = resolve(cwd, [...this.knownRepos]);
+    this.repoCache.set(cwd, resolved);
+    if (resolved) this.knownRepos.add(resolved);
+    return resolved;
+  }
+
+  private insertEvent(session: string, event: ToolEvent): void {
+    insertToolEvent(this.db, {
+      session,
+      repo: this.resolveRepo(event.cwd),
+      branch: event.branch,
+      cwd: event.cwd,
+      tool: event.tool,
+      file: event.file,
+      command: event.command,
+      ts: event.timestamp || new Date().toISOString(),
+      host: "codex",
+    });
   }
 
   private maxFileBytes(): number {
@@ -320,7 +321,7 @@ export class CodexLiveCapture {
     const session = sessionId(file);
     for (const line of lines) {
       const parsed = parseCodexJsonlLine(line, state.codex);
-      for (const event of parsed.toolEvents) insertEvent(this.db, session, event);
+      for (const event of parsed.toolEvents) this.insertEvent(session, event);
     }
   }
 }

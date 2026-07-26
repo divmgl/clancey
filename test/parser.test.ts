@@ -12,6 +12,7 @@ import {
   listSubagents,
   parseSubagent,
   hermesRefPath,
+  hermesUnitStamp,
   sessionIdOf,
   parseAny,
 } from "../src/parser.ts";
@@ -505,5 +506,153 @@ describe("parseHermesTranscript", () => {
     const t = await parseAny(ref);
     assert.equal(t.sessionId, fx.sessionId);
     assert.equal(t.framing, fx.framing);
+  });
+});
+
+/**
+ * A Hermes continuation chain, shaped the way the real state.db is: the child persists a full
+ * replay of what it inherited (re-stamped at the fork moment, and compacted, so the replay is
+ * interleaved with new turns rather than being a clean prefix), and the parent holds one row
+ * written twice verbatim after a rewind.
+ */
+function buildHermesChain(home: string): { dbPath: string; parentId: string; childId: string; loneId: string } {
+  fs.mkdirSync(home, { recursive: true });
+  const dbPath = path.join(home, "state.db");
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      parent_session_id TEXT,
+      started_at REAL NOT NULL,
+      cwd TEXT,
+      title TEXT
+    );
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT,
+      tool_calls TEXT,
+      timestamp REAL NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+  `);
+
+  const parentId = "ses_chain_parent";
+  const childId = "ses_chain_child";
+  const loneId = "ses_chain_unrelated";
+  const t0 = 1_700_200_000;
+  const fork = t0 + 900;
+
+  const addSession = db.prepare(
+    `INSERT INTO sessions (id, source, parent_session_id, started_at, cwd, title)
+     VALUES (?, 'cli', ?, ?, '/repo', ?)`,
+  );
+  addSession.run(parentId, null, t0, "chain parent");
+  addSession.run(childId, parentId, fork, "chain child");
+  addSession.run(loneId, null, t0 + 5000, "unrelated session");
+
+  const addMsg = db.prepare(
+    `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+     VALUES (?, ?, ?, ?, ?, 1)`,
+  );
+  const runTests = JSON.stringify([
+    { type: "function", function: { name: "terminal", arguments: JSON.stringify({ command: "bun test" }) } },
+  ]);
+
+  // Parent conversation. The second `addMsg` of the opening ask is the rewind duplicate: same
+  // timestamp, same body, stored twice.
+  addMsg.run(parentId, "user", CHAIN_OPENING, null, t0);
+  addMsg.run(parentId, "user", CHAIN_OPENING, null, t0);
+  addMsg.run(parentId, "assistant", "Running the suite to see the failure.", runTests, t0 + 1);
+  addMsg.run(parentId, "user", CHAIN_SECOND_ASK, null, t0 + 2);
+  // A genuine repeat inside one session: the same command run again, minutes later.
+  addMsg.run(parentId, "assistant", "Running the suite to see the failure.", runTests, t0 + 300);
+
+  // Child replay: every inherited turn again, re-stamped at the fork, compacted (the second ask
+  // is dropped) and interleaved with a summary the child inserted, then the child's own turn.
+  addMsg.run(childId, "user", CHAIN_OPENING, null, fork);
+  addMsg.run(childId, "assistant", "Running the suite to see the failure.", runTests, fork);
+  addMsg.run(childId, "assistant", "Summary of the earlier session: the suite was failing.", null, fork);
+  addMsg.run(childId, "user", CHAIN_CHILD_ASK, null, fork + 10);
+
+  addMsg.run(loneId, "user", "Unrelated session asking about the deploy pipeline.", null, t0 + 5000);
+
+  db.close();
+  return { dbPath, parentId, childId, loneId };
+}
+
+const CHAIN_OPENING = "The auth suite is failing, can you take a look at it?";
+const CHAIN_SECOND_ASK = "Does the failure reproduce on a clean checkout too?";
+const CHAIN_CHILD_ASK = "Now please add a regression test for that case.";
+
+describe("Hermes continuation folding", () => {
+  let tmp: string;
+  let prevHermes: string | undefined;
+  let fx: ReturnType<typeof buildHermesChain>;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-hermes-chain-"));
+    prevHermes = process.env.HERMES_HOME;
+    process.env.HERMES_HOME = tmp;
+    fx = buildHermesChain(tmp);
+  });
+
+  afterEach(() => {
+    if (prevHermes === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prevHermes;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("a continuation's replay of the shared prefix is not stored twice", async () => {
+    const t = await parseHermesTranscript(hermesRefPath(fx.dbPath, fx.parentId));
+    const opening = t.messages.filter((m) => m.text === CHAIN_OPENING);
+    assert.equal(opening.length, 1, "the opening ask survives exactly once");
+    assert.equal(t.userTurns.filter((u) => u.text === CHAIN_OPENING).length, 1);
+    // The child's own turn and its summary are new, so they are kept.
+    assert.ok(t.messages.some((m) => m.text === CHAIN_CHILD_ASK));
+    assert.ok(t.messages.some((m) => m.text.startsWith("Summary of the earlier session")));
+    // The parent's compacted-away turn is not lost just because the child dropped it.
+    assert.ok(t.messages.some((m) => m.text === CHAIN_SECOND_ASK));
+  });
+
+  test("collapses a row persisted twice verbatim, but keeps a genuine repeat", async () => {
+    const t = await parseHermesTranscript(hermesRefPath(fx.dbPath, fx.parentId));
+    // The rewind duplicate (same timestamp, same body) is gone; the same assistant turn at a
+    // later timestamp is real conversation and stays.
+    const runs = t.messages.filter((m) => m.text.startsWith("Running the suite"));
+    assert.equal(runs.length, 2);
+    assert.notEqual(runs[0].timestamp, runs[1].timestamp);
+    const terminals = t.toolEvents.filter((e) => e.tool === "terminal");
+    assert.equal(terminals.length, 2, "one tool event per surviving assistant turn");
+  });
+
+  test("the unit stamp moves only when that session's own family changes", () => {
+    const parentRef = hermesRefPath(fx.dbPath, fx.parentId);
+    const loneRef = hermesRefPath(fx.dbPath, fx.loneId);
+    const parentBefore = hermesUnitStamp(parentRef);
+    const loneBefore = hermesUnitStamp(loneRef);
+    assert.ok(parentBefore > 0 && loneBefore > 0);
+
+    // Writing an unrelated session bumps the shared state.db mtime — the stamp must not follow.
+    const db = new Database(fx.dbPath);
+    db.prepare(
+      `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+       VALUES (?, 'user', 'Another unrelated question about the pipeline.', NULL, ?, 1)`,
+    ).run(fx.loneId, 1_700_209_999);
+    db.close();
+
+    assert.equal(hermesUnitStamp(parentRef), parentBefore, "unrelated write leaves the stamp alone");
+    assert.notEqual(hermesUnitStamp(loneRef), loneBefore, "the written session's stamp moves");
+
+    // A write to a *child* is a change to the parent's unit, since the child folds into it.
+    const db2 = new Database(fx.dbPath);
+    db2.prepare(
+      `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+       VALUES (?, 'user', 'One more thing in the continuation, please.', NULL, ?, 1)`,
+    ).run(fx.childId, 1_700_210_500);
+    db2.close();
+    assert.notEqual(hermesUnitStamp(parentRef), parentBefore, "a child write moves the parent stamp");
   });
 });

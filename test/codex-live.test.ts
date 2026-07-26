@@ -195,6 +195,68 @@ describe("CodexLiveCapture", () => {
   });
 });
 
+describe("repo resolution caching", () => {
+  test("many events from the same cwd resolve the repo once, not once per event", async () => {
+    const file = path.join(root, "rollout-cache.jsonl");
+    fs.writeFileSync(file, line(meta("/repo", "feature/live")));
+
+    let calls = 0;
+    const capture = new CodexLiveCapture(db, {
+      listFiles: async () => [file],
+      requireLock: false,
+      canonicalRepo: (cwd) => {
+        calls++;
+        return cwd;
+      },
+    });
+    await capture.start();
+
+    let body = "";
+    for (let i = 0; i < 50; i++) body += line(shell(`cmd ${i}`, `2026-02-01T10:00:0${i % 10}.000Z`));
+    fs.appendFileSync(file, body);
+    await capture.pollNow();
+
+    // A second poll with more events must still not re-shell for the same cwd.
+    fs.appendFileSync(file, line(shell("later", "2026-02-01T10:01:00.000Z")));
+    await capture.pollNow();
+    capture.stop();
+
+    assert.equal(calls, 1, "canonicalRepo must be called once per distinct cwd");
+    assert.equal(capture.repoResolutions, 1);
+    const [item] = recall(db, { branch: "feature/live" });
+    assert.equal(item.toolEventCount, 51);
+    assert.equal(item.repo, "/repo");
+  });
+
+  test("a different cwd is resolved separately", async () => {
+    const file = path.join(root, "rollout-two-cwds.jsonl");
+    fs.writeFileSync(file, line(meta("/repo-a", "a")));
+
+    const seen: (string | null)[] = [];
+    const capture = new CodexLiveCapture(db, {
+      listFiles: async () => [file],
+      requireLock: false,
+      canonicalRepo: (cwd) => {
+        seen.push(cwd);
+        return cwd;
+      },
+    });
+    await capture.start();
+
+    fs.appendFileSync(
+      file,
+      line(shell("one", "2026-02-01T10:00:01.000Z")) +
+        line(meta("/repo-b", "b")) +
+        line(shell("two", "2026-02-01T10:00:02.000Z")) +
+        line(shell("three", "2026-02-01T10:00:03.000Z")),
+    );
+    await capture.pollNow();
+    capture.stop();
+
+    assert.deepEqual(seen, ["/repo-a", "/repo-b"]);
+  });
+});
+
 describe("tryClaimCodexLiveLock / single-owner", () => {
   test("exactly one of two contenders becomes the active live-capture owner", async () => {
     const lockPath = path.join(root, "codex-live.lock");
@@ -221,6 +283,36 @@ describe("tryClaimCodexLiveLock / single-owner", () => {
     } finally {
       db2.close();
     }
+  });
+
+  test("stop() releases the lock so the next start takes the uncontended path", async () => {
+    const lockPath = path.join(root, "shutdown.lock");
+    const listFiles = async () => [] as string[];
+
+    const first = startCodexLiveCapture(db, { lockPath, listFiles, pollMs: 60_000 });
+    assert.ok(first, "first start must own the lock");
+    await new Promise((r) => setImmediate(r));
+    assert.equal(fs.existsSync(lockPath), true);
+
+    first!.stop();
+    assert.equal(fs.existsSync(lockPath), false, "stop() must remove the lock file");
+
+    // Uncontended means the fresh claim creates the file outright; the stale-PID steal path is the
+    // only thing that renames, so a rename here would mean shutdown left a dead-PID lock behind.
+    const origRename = fs.renameSync;
+    let renames = 0;
+    fs.renameSync = ((...args: Parameters<typeof fs.renameSync>) => {
+      renames++;
+      return origRename(...args);
+    }) as typeof fs.renameSync;
+    try {
+      const second = startCodexLiveCapture(db, { lockPath, listFiles, pollMs: 60_000 });
+      assert.ok(second, "lock must be freely claimable after stop()");
+      second!.stop();
+    } finally {
+      fs.renameSync = origRename;
+    }
+    assert.equal(renames, 0, "fresh claim must not go through stale-PID recovery");
   });
 
   test("stale lock from a dead pid is reclaimable", () => {

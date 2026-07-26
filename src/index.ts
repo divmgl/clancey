@@ -32,10 +32,10 @@ import {
 import { resolveSession, parseAny, listSubagents, parseSubagent, listGrokSubagents, ConvMessage } from "./parser.js";
 import { embedOne } from "./embeddings.js";
 import { runHook } from "./hook.js";
-import { setup, backfill, Target } from "./setup.js";
+import { setup, backfill, autoRefreshBackfill, Target } from "./setup.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import { resolveTimeFilter } from "./time.js";
-import { startCodexLiveCapture } from "./codex-live.js";
+import { startCodexLiveCapture, type CodexLiveCapture } from "./codex-live.js";
 import { registerMcpClient, heartbeatMcpClient, unregisterMcpClient } from "./mcp-clients.js";
 import { ensureWatchRunning, runWatchCli } from "./watch.js";
 import { resolveClanceyDir, resolveDbPath } from "./paths.js";
@@ -68,7 +68,9 @@ async function withAutoRefresh<T>(
   lastAutoRefresh = now;
   let migrating = false;
   try {
-    migrating = (await backfill(db, { force: false, migration: "defer" })).migrating === true;
+    // Paced and single-owner across processes — see autoRefreshBackfill. The throttle above is a
+    // module-level variable and cannot restrain a sibling MCP process; the lock file can.
+    migrating = (await autoRefreshBackfill(db)).migrating;
   } catch (err) {
     logError("auto-refresh before empty result failed", err);
     return first;
@@ -844,11 +846,23 @@ async function runServer(): Promise<void> {
   }, MCP_HEARTBEAT_MS);
   beat.unref?.();
 
+  // Assigned below, after the store opens; cleanup may run before that on an early signal.
+  let codexLive: CodexLiveCapture | null = null;
+
   let cleaned = false;
   const cleanup = (): void => {
     if (cleaned) return;
     cleaned = true;
     clearInterval(beat);
+    // Without this, every ordinary shutdown leaves ~/.clancey/codex-live.lock on disk naming a
+    // dead PID, so the next server start has to go through stale-PID recovery instead of the
+    // uncontended path. startCodexLiveCapture returns null when another process owns the lock —
+    // that process must keep it.
+    try {
+      codexLive?.stop();
+    } catch {
+      // ignore
+    }
     try {
       unregisterMcpClient(clientId, { dir });
     } catch {
@@ -868,7 +882,7 @@ async function runServer(): Promise<void> {
   ensureWatchRunning({ dir });
 
   const db = openStore(resolveDbPath(dir));
-  startCodexLiveCapture(db);
+  codexLive = startCodexLiveCapture(db);
   const server = buildServer(db);
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
 import { isPidAlive } from "./pid.js";
+import { readPidLock, sleepSync, tryClaimPidLock } from "./file-lock.js";
+import { log } from "./logger.js";
 import { mcpClientsPath, resolveClanceyDir } from "./paths.js";
 
 export interface McpClientRecord {
@@ -51,36 +53,83 @@ function writeFileAtomic(file: string, data: McpClientsFile): void {
   fs.renameSync(tmp, file);
 }
 
-function withRegistryFileLock(file: string, fn: () => void): void {
-  const lock = `${file}.lock`;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const started = Date.now();
-  while (Date.now() - started < 5_000) {
+/** Total time a caller will wait for the registry lock before giving up on it. */
+const LOCK_TIMEOUT_MS = 5_000;
+
+/**
+ * Delete `${file}.<pid>.tmp` files whose owning PID is gone.
+ *
+ * `writeFileAtomic` writes a PID-named temp and renames it into place; a process killed between
+ * those two steps leaves the temp behind forever. Every MCP client heartbeats, so the leak is
+ * unbounded over time. The sweep is a directory scan, so it runs only on registration and when a
+ * caller actually has to wait for the lock — never on the uncontended heartbeat path.
+ */
+function sweepOrphanedTemps(file: string): void {
+  const dir = path.dirname(file);
+  const prefix = `${path.basename(file)}.`;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".tmp")) continue;
+    const pid = Number(entry.slice(prefix.length, -".tmp".length));
+    if (!Number.isInteger(pid) || pid <= 0 || isPidAlive(pid)) continue;
     try {
-      const fd = fs.openSync(lock, "wx");
+      fs.unlinkSync(path.join(dir, entry));
+    } catch {
+      // ignore — another sweeper won the race
+    }
+  }
+}
+
+/**
+ * Run `fn` while holding the registry lock, waiting in real sleeps for a live holder to finish.
+ *
+ * Two things made the old implementation actively harmful (CLA-3). The lock file was zero-byte
+ * with no owner recorded and no stale recovery, so a process killed while holding it left a lock
+ * nobody could ever clear; and waiters burned a core in `while (Date.now() < end) {}`. Together
+ * that meant every caller — `listLiveMcpClients` runs every 500ms in watch, plus one heartbeat
+ * per MCP client — spun a full CPU for five seconds and then ran unlocked anyway. The lock now
+ * carries the owner PID so `tryClaimPidLock` can reclaim it from a dead holder, and waiting is a
+ * futex sleep.
+ */
+function withRegistryFileLock(file: string, fn: () => void): void {
+  const lockPath = `${file}.lock`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let swept = false;
+  let backoffMs = 5;
+  for (;;) {
+    const lock = tryClaimPidLock(lockPath);
+    if (lock.owned) {
       try {
         fn();
       } finally {
-        fs.closeSync(fd);
-        try {
-          fs.unlinkSync(lock);
-        } catch {
-          // ignore
-        }
+        lock.release();
       }
       return;
-    } catch {
-      // spin
-      const wait = Atomics ? undefined : undefined;
-      void wait;
-      // busy-yield
-      const end = Date.now() + 5;
-      while (Date.now() < end) {
-        /* spin */
-      }
     }
+    if (Date.now() >= deadline) break;
+    if (!swept) {
+      // We are contended, which is also the only cheap moment to notice leaked temps.
+      swept = true;
+      sweepOrphanedTemps(file);
+    }
+    sleepSync(backoffMs);
+    backoffMs = Math.min(backoffMs * 2, 25);
   }
-  // Last resort without lock (tests / broken FS).
+
+  // Last resort without the lock. A live owner held it for the entire timeout (or the FS refuses
+  // to give us one), and dropping the write entirely would silently lose a registration; log it,
+  // because before this the registry degraded to no locking without a trace.
+  log(
+    `mcp-clients: registry lock at ${lockPath} unavailable after ${LOCK_TIMEOUT_MS}ms ` +
+      `(holder pid ${readPidLock(lockPath) ?? "unknown"}); proceeding unlocked`,
+  );
   fn();
 }
 
@@ -101,6 +150,9 @@ export function registerMcpClient(opts: RegistryOptions = {}): string {
   const nowMs = opts.nowMs ?? Date.now;
   const id = `${process.pid}-${nowMs().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const ts = nowIso(nowMs);
+  // Once per process, not once per heartbeat: clears temps leaked by clients that were killed
+  // mid-write in a previous run.
+  sweepOrphanedTemps(file);
   mutate(file, (data) => {
     data.clients[id] = { pid: process.pid, startedAt: ts, lastBeat: ts };
   });

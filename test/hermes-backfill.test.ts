@@ -177,4 +177,48 @@ describe("Hermes backfill", () => {
       assert.ok(events.every((e) => e.host === "hermes"));
     },
   );
+
+  test(
+    "a write to one Hermes session does not re-ingest the others",
+    { timeout: 120_000 },
+    async () => {
+      // Every Hermes session lives in one shared state.db, so any write moves that file's mtime.
+      // Gating on it made all N sessions look changed and re-parse on every pass; the gate now
+      // uses a per-session stamp, so only the session that actually moved is re-read.
+      const statePath = path.join(process.env.HERMES_HOME as string, "state.db");
+      const other = "ses_backfill_hermes_other";
+      const seed = new Database(statePath);
+      seed
+        .prepare(
+          `INSERT INTO sessions (id, source, parent_session_id, started_at, cwd, title)
+           VALUES (?, 'cli', NULL, ?, ?, ?)`,
+        )
+        .run(other, 1_700_200_000, "/repo", "Second Hermes session");
+      seed
+        .prepare(
+          `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+           VALUES (?, 'user', ?, NULL, ?, 1)`,
+        )
+        .run(other, "A second, entirely unrelated Hermes conversation.", 1_700_200_000);
+      seed.close();
+
+      const first = await backfill(db);
+      assert.equal(first.sessions, 2, "both sessions ingested on the first pass");
+
+      const nothingChanged = await backfill(db);
+      assert.equal(nothingChanged.sessions, 0, "an idle pass re-ingests nothing");
+
+      const append = new Database(statePath);
+      append
+        .prepare(
+          `INSERT INTO messages (session_id, role, content, tool_calls, timestamp, active)
+           VALUES (?, 'user', ?, NULL, ?, 1)`,
+        )
+        .run(other, "Following up on that second conversation now.", 1_700_200_100);
+      append.close();
+
+      const after = await backfill(db);
+      assert.equal(after.sessions, 1, "only the session that was written is re-ingested");
+    },
+  );
 });

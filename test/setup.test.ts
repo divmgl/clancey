@@ -4,6 +4,12 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import {
+  AUTO_REFRESH_PACE,
+  autoRefreshBackfill,
+  backfill,
+  pacingDebtMs,
+  payPacingDebt,
+  type BackfillOptions,
   configureOpencode,
   configureOpencodePlugin,
   configureGrok,
@@ -19,6 +25,9 @@ import {
   wireHooks,
   type ClanceyLaunch,
 } from "../src/setup.ts";
+import { openStore, type Store } from "../src/store.ts";
+import { isPidLockHeld, tryClaimPidLock } from "../src/file-lock.ts";
+import { refreshLockPath } from "../src/paths.ts";
 
 const LAUNCH: ClanceyLaunch = {
   node: "/usr/local/bin/node",
@@ -470,5 +479,189 @@ describe("configureSkill", () => {
     const { result, file } = configureSkill("claude");
     assert.equal(result, "updated");
     assert.match(fs.readFileSync(file, "utf-8"), /name: clancey/);
+  });
+});
+
+describe("pacing (CLA-2)", () => {
+  test("debt is proportional to work at any size — the old 2s cap voided the pace setting", () => {
+    // A 50% pace means resting as long as you worked, however long that was. Clamping the rest
+    // was the bug: a 22s unit rested 2s, a 92% duty cycle from a 50% setting.
+    for (const worked of [100, 2_000, 10_000, 22_000]) {
+      const rest = pacingDebtMs(worked, 0.5);
+      assert.equal(rest, worked);
+      const duty = worked / (worked + rest);
+      assert.ok(Math.abs(duty - 0.5) < 0.01, `duty ${duty} for worked=${worked}`);
+    }
+    assert.equal(pacingDebtMs(1_000, 0.25), 3_000);
+    assert.equal(pacingDebtMs(10_000, 1), 0);
+  });
+
+  test("a debt is paid in full when nothing interrupts it", async () => {
+    const start = Date.now();
+    const owed = await payPacingDebt(600);
+    assert.equal(owed, 0);
+    assert.ok(Date.now() - start >= 550, `slept ${Date.now() - start}ms`);
+  });
+
+  test("a stop request lands mid-rest and the unpaid remainder is carried, not written off", async () => {
+    const start = Date.now();
+    let stop = false;
+    setTimeout(() => {
+      stop = true;
+    }, 100);
+    const owed = await payPacingDebt(30_000, () => stop);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 2_000, `rest should abort promptly, took ${elapsed}ms`);
+    assert.ok(owed > 25_000, `remaining debt should survive the abort, got ${owed}`);
+  });
+});
+
+describe("autoRefreshBackfill (CLA-1)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-refresh-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("runs the scan paced well below a full core", async () => {
+    const seen: BackfillOptions[] = [];
+    const result = await autoRefreshBackfill(null as unknown as Store, {
+      dir,
+      run: async (_db, o) => {
+        seen.push(o);
+        return { sessions: 0, events: 0, embeddings: 0 };
+      },
+    });
+    assert.deepEqual(result, { migrating: false, refreshed: true });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].pace, AUTO_REFRESH_PACE);
+    assert.ok(AUTO_REFRESH_PACE < 1, "auto-refresh must never run at full speed");
+    assert.equal(seen[0].migration, "defer");
+  });
+
+  test("skips entirely while another process holds the refresh lock", async () => {
+    const held = tryClaimPidLock(refreshLockPath(dir));
+    assert.equal(held.owned, true);
+
+    let calls = 0;
+    const skipped = await autoRefreshBackfill(null as unknown as Store, {
+      dir,
+      run: async () => {
+        calls++;
+        return { sessions: 0, events: 0, embeddings: 0 };
+      },
+    });
+    assert.deepEqual(skipped, { migrating: false, refreshed: false });
+    assert.equal(calls, 0, "a second client must not rescan the same corpus");
+
+    // Released: the next caller becomes the single owner.
+    held.release();
+    const ran = await autoRefreshBackfill(null as unknown as Store, {
+      dir,
+      run: async () => {
+        calls++;
+        return { sessions: 0, events: 0, embeddings: 0 };
+      },
+    });
+    assert.equal(ran.refreshed, true);
+    assert.equal(calls, 1);
+  });
+
+  test("releases the lock even when the scan throws", async () => {
+    await assert.rejects(
+      autoRefreshBackfill(null as unknown as Store, {
+        dir,
+        run: async () => {
+          throw new Error("scan blew up");
+        },
+      }),
+      /scan blew up/,
+    );
+    assert.equal(isPidLockHeld(refreshLockPath(dir)), false);
+  });
+});
+
+describe("backfill abort (CLA-5)", () => {
+  let dir: string;
+  let hostRoot: string;
+  const HOST_ENV = ["GROK_HOME", "CLAUDE_HOME", "CODEX_HOME", "XDG_DATA_HOME", "HERMES_HOME"] as const;
+  let prev: Record<string, string | undefined>;
+
+  /** One Grok session unit: summary + a single user turn. */
+  function writeGrokSession(id: string): void {
+    const sessionDir = path.join(process.env.GROK_HOME!, "sessions", encodeURIComponent("/repo/abort"), id);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "summary.json"),
+      JSON.stringify({
+        info: { id, cwd: "/repo/abort" },
+        generated_title: `Abort fixture ${id}`,
+        session_summary: `Abort fixture ${id}`,
+        head_branch: "main",
+        session_kind: "primary",
+        created_at: "2026-06-01T00:00:00Z",
+      }) + "\n",
+    );
+    fs.writeFileSync(
+      path.join(sessionDir, "updates.jsonl"),
+      JSON.stringify({
+        timestamp: 1717200000,
+        method: "session/update",
+        params: {
+          sessionId: id,
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text: `a substantial user turn recorded in session ${id}` },
+            _meta: { agentTimestampMs: 1717200000000 },
+          },
+        },
+      }) + "\n",
+    );
+  }
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-abort-"));
+    hostRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-abort-hosts-"));
+    prev = Object.fromEntries(HOST_ENV.map((k) => [k, process.env[k]]));
+    for (const k of HOST_ENV) process.env[k] = path.join(hostRoot, k.toLowerCase());
+    for (const id of ["ses_a", "ses_b", "ses_c", "ses_d"]) writeGrokSession(id);
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(hostRoot, { recursive: true, force: true });
+  });
+
+  test("stops mid-scan on request and the next pass resumes where it left off", async () => {
+    const db = openStore(path.join(dir, "clancey.db"));
+    try {
+      // True after the first unit: a stop must not have to wait out the whole corpus, which on a
+      // real machine is minutes of parsing (the first SIGTERM looked swallowed).
+      let ingested = 0;
+      const stopped = await backfill(db, { shouldStop: () => ingested++ >= 1 });
+      assert.equal(stopped.stopped, true);
+      assert.equal(stopped.sessions, 1, "should abandon the pass after one unit");
+
+      // Cursors are per unit, so the abandoned pass costs nothing: the rest land next time.
+      const rest = await backfill(db, {});
+      assert.equal(rest.stopped, undefined);
+      assert.equal(rest.sessions, 3);
+
+      const sessions = db.prepare(`SELECT COUNT(*) AS n FROM sessions`).get() as { n: number };
+      assert.equal(sessions.n, 4);
+
+      // And a third pass re-reads nothing — the stopped pass's work was durably recorded.
+      assert.equal((await backfill(db, {})).sessions, 0);
+    } finally {
+      db.close();
+    }
   });
 });

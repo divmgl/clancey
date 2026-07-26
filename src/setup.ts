@@ -44,7 +44,7 @@ import {
   listGrokSubagents,
   listOpencodeUnitFiles,
   listGrokUnitFiles,
-  listHermesUnitFiles,
+  hermesUnitStamp,
   parseAny,
   parseSubagent,
   getOpencodeStorageDir,
@@ -56,6 +56,8 @@ import {
 import { embedOne } from "./embeddings.js";
 import { canonicalRepo } from "./git.js";
 import { setConsoleSilent, log } from "./logger.js";
+import { tryClaimPidLock } from "./file-lock.js";
+import { refreshLockPath, resolveClanceyDir } from "./paths.js";
 
 const tildify = (p: string) => p.replace(os.homedir(), "~");
 
@@ -64,8 +66,13 @@ export type Target = "claude" | "codex" | "opencode" | "grok" | "hermes";
 
 const POST_TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|search_replace|run_terminal_command";
 const FRAMING_MAX_CHARS = 2000;
-/** Cap on a single pacing rest, so one huge session can't stall the scan for minutes. */
-const MAX_PACE_REST_MS = 2_000;
+/**
+ * Longest single sleep inside a pacing rest. This bounds how long a stop request waits, not how
+ * much rest is owed: the debt left over is carried to the next slice. The previous shape capped
+ * the *total* rest at 2s and discarded the remainder, which silently voided `pace` — a 22s
+ * session rested 2s instead of 22s, a 92% duty cycle from a 50% setting.
+ */
+const PACE_SLICE_MS = 250;
 const LEGACY_INDEX = path.join(CLANCEY_DIR, "conversations.lance");
 
 /**
@@ -120,15 +127,59 @@ function isPrefixOf(cursor: IngestCursor, parsed: ParsedTranscript): boolean {
   return cursor.lastTs === parsed.messages[cursor.msgCount - 1].timestamp;
 }
 
+export interface BackfillOptions {
+  force?: boolean;
+  migration?: "inline" | "defer";
+  /** Fraction of a core the scan may use (0.05–1). Below 1 the loop rests between units. */
+  pace?: number;
+  /**
+   * Polled between ingest units and inside every pacing sleep. A scan of the whole corpus takes
+   * minutes, so a caller that only checks a flag between calls (the watcher, on SIGTERM) would
+   * appear hung for the length of a pass.
+   */
+  shouldStop?: () => boolean;
+}
+
+export interface BackfillResult {
+  sessions: number;
+  events: number;
+  embeddings: number;
+  migrating?: boolean;
+  /** True when `shouldStop` cut the pass short; the units already written are still valid. */
+  stopped?: boolean;
+}
+
+/**
+ * Rest owed after a unit that burned `workedMs`, to hold the loop at `pace` of a core.
+ * Exported for the pacing test: the whole bug was that this number used to be truncated.
+ */
+export function pacingDebtMs(workedMs: number, pace: number): number {
+  if (pace >= 1) return 0;
+  return Math.round(workedMs * (1 / pace - 1));
+}
+
+/**
+ * Sleep `ms`, in slices, giving up early once `shouldStop` turns true.
+ * Returns the milliseconds still owed, so an interrupted rest is not silently forgiven.
+ */
+export async function payPacingDebt(ms: number, shouldStop?: () => boolean): Promise<number> {
+  let owed = ms;
+  while (owed > 0) {
+    if (shouldStop?.()) return owed;
+    const slice = Math.min(owed, PACE_SLICE_MS);
+    const start = Date.now();
+    await new Promise((r) => setTimeout(r, slice));
+    owed -= Math.max(slice, Date.now() - start);
+  }
+  return 0;
+}
+
 /**
  * Ingest existing transcripts into the store. Incremental by mtime unless `force`.
  * Historical sessions have no recorded decisions, so coverage comes from a framing
  * embedding (title + first user turn) per session — keeping every session searchable.
  */
-export async function backfill(
-  db: Store,
-  opts: { force?: boolean; migration?: "inline" | "defer"; pace?: number } = {},
-): Promise<{ sessions: number; events: number; embeddings: number; migrating?: boolean }> {
+export async function backfill(db: Store, opts: BackfillOptions = {}): Promise<BackfillResult> {
   // Fraction of a core the scan may use. A foreground `clancey backfill` was asked for and
   // should finish; the watcher is a daemon nobody asked for and must stay out of the way.
   const pace = Math.min(1, Math.max(0.05, opts.pace ?? 1));
@@ -176,8 +227,17 @@ export async function backfill(
   let sessions = 0;
   let events = 0;
   let embeddings = 0;
+  // Rest owed but not yet slept off, carried across units. Paying the debt down instead of
+  // capping each rest is what makes `pace` hold no matter how big an individual session is.
+  let paceDebtMs = 0;
 
   for (const ref of await newestFirst(transcripts)) {
+    // A pass is safe to abandon anywhere: cursors are written per unit, so whatever has been
+    // ingested stays ingested and the next pass resumes at the first unit without one. Bailing
+    // out before the retention prune and the reingest-pending clear below is deliberate — both
+    // claim the whole corpus was walked, and after a stop it wasn't.
+    if (opts.shouldStop?.()) return { sessions, events, embeddings, stopped: true };
+
     const file = ref.path;
     const unitStart = Date.now();
 
@@ -198,7 +258,7 @@ export async function backfill(
         : ref.kind === "grok"
           ? await listGrokUnitFiles(file)
           : ref.kind === "hermes"
-            ? listHermesUnitFiles(file)
+            ? [] // stamped logically below, not by file mtime
             : [file, ...subRefs.map((s) => s.path)];
     const mtimes = await Promise.all(
       unitFiles.map((f) =>
@@ -208,7 +268,11 @@ export async function backfill(
         ),
       ),
     );
-    const unitMtime = Math.max(0, ...mtimes);
+    // Hermes stores every session in one shared state.db, so its file mtime is a corpus-wide
+    // stamp: a write to any Hermes session moved it, every indexed Hermes session then failed
+    // the gate below, and the whole Hermes corpus re-parsed on every watch cycle for zero new
+    // rows. Its stamp comes from that session's own rows instead.
+    const unitMtime = ref.kind === "hermes" ? hermesUnitStamp(file) : Math.max(0, ...mtimes);
     if (unitMtime === 0) continue;
     if (!reingest && getIngestedMtime(db, file) === unitMtime) continue;
 
@@ -247,6 +311,17 @@ export async function backfill(
     const first = parsed.toolEvents[0];
     const host = ref.kind;
     const messageRepo = resolveRepo(parsed.cwd ?? first?.cwd ?? null);
+
+    // Warm the repo cache for every cwd this unit will write, BEFORE the write transaction opens.
+    // Each cache miss shells out to git (~3ms, plus an existsSync walk for a deleted worktree),
+    // and doing that from inside db.transaction() held the write lock across one subprocess spawn
+    // per distinct worktree — with several MCP clients and the watcher sharing the store on a
+    // busy_timeout of 5s, a session touching many worktrees pushed the others toward SQLITE_BUSY.
+    // The transaction body then only ever hits the already-populated cache.
+    for (const [i, stream] of streams.entries()) {
+      const fromEv = appendable ? (cursors[i] as IngestCursor).evCount : 0;
+      for (const e of stream.parsed.toolEvents.slice(fromEv)) resolveRepo(e.cwd);
+    }
 
     const apply = db.transaction(() => {
       upsertSessionCard(db, {
@@ -336,12 +411,14 @@ export async function backfill(
     sessions++;
 
     // Parsing a session is a synchronous CPU burst; left unchecked the loop pins one core for
-    // the whole scan. Resting in proportion to the work just done holds it near `pace` without
-    // needing to know how big the next session is.
+    // the whole scan. Each unit adds rest in proportion to the work it just did, which holds the
+    // duty cycle near `pace` without needing to know how big the next session is. The rest is
+    // owed as a debt rather than slept in one go: the sleep is sliced so a stop request lands
+    // within PACE_SLICE_MS, and whatever a stop leaves unpaid rolls into the next unit instead
+    // of being written off.
     if (pace < 1) {
-      const worked = Date.now() - unitStart;
-      const rest = Math.round(worked * (1 / pace - 1));
-      if (rest > 0) await new Promise((r) => setTimeout(r, Math.min(rest, MAX_PACE_REST_MS)));
+      paceDebtMs += pacingDebtMs(Date.now() - unitStart, pace);
+      paceDebtMs = await payPacingDebt(paceDebtMs, opts.shouldStop);
     }
   }
 
@@ -352,6 +429,38 @@ export async function backfill(
   if (isReingestPending(db)) setReingestPending(db, false);
 
   return { sessions, events, embeddings };
+}
+
+/**
+ * Fraction of a core the MCP auto-refresh may use. Deliberately below the watcher's 0.5: this
+ * fires inside a process the user is waiting on, over a corpus that is gigabytes of transcripts,
+ * to answer a question nobody asked ("is there anything newer?"). Unpaced it scanned flat out —
+ * two MCP processes were observed at 99.6% of a core for 78 minutes.
+ */
+export const AUTO_REFRESH_PACE = 0.25;
+
+/**
+ * The refresh an MCP lookup runs when it comes back empty: paced, and single-owner machine-wide.
+ *
+ * Every connected client shares one index, so without the lock N clients each ran a full scan of
+ * the same corpus at once. Skipping when someone else holds it costs nothing — the holder is
+ * doing the identical work, and the caller falls back to the result it already had.
+ */
+export async function autoRefreshBackfill(
+  db: Store,
+  opts: { dir?: string; run?: (db: Store, o: BackfillOptions) => Promise<BackfillResult> } = {},
+): Promise<{ migrating: boolean; refreshed: boolean }> {
+  const lock = tryClaimPidLock(refreshLockPath(opts.dir ?? resolveClanceyDir()));
+  if (!lock.owned) return { migrating: false, refreshed: false };
+  try {
+    const run = opts.run ?? backfill;
+    const stats = await run(db, { force: false, migration: "defer", pace: AUTO_REFRESH_PACE });
+    return { migrating: stats.migrating === true, refreshed: true };
+  } finally {
+    // Including on throw: a lock leaked by a crashing refresh would freeze every client's
+    // auto-refresh until the PID happened to be reused.
+    lock.release();
+  }
 }
 
 /**

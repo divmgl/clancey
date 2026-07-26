@@ -766,10 +766,48 @@ export function parseAny(ref: TranscriptRef): Promise<ParsedTranscript> {
 
 // ─── Hermes Agent ────────────────────────────────────────────────────────────
 
-/** Files that gate incremental backfill for one Hermes session (the shared state.db). */
-export function listHermesUnitFiles(refPath: string): string[] {
-  const { dbPath } = parseHermesRefPath(refPath);
-  return fs.existsSync(dbPath) ? [dbPath] : [];
+/**
+ * Change stamp for one Hermes session, standing in for a file mtime in the incremental gate.
+ *
+ * Hermes keeps every session in a single shared `state.db`, so that file's mtime is a
+ * corpus-wide stamp: one Hermes write moved it and *every* indexed session then failed the
+ * "unchanged since last ingest" check and re-parsed on every watch cycle. This stamp is derived
+ * from this session's family alone — the newest live row id, plus how many live rows there are
+ * so a rewind that deactivates rows also registers — so it moves only when this conversation
+ * does. Returns 0 when the DB or the session is unreadable/empty, which the caller treats the
+ * same as an unstattable file.
+ */
+export function hermesUnitStamp(refPath: string): number {
+  const { dbPath, sessionId } = parseHermesRefPath(refPath);
+  if (!sessionId || !fs.existsSync(dbPath)) return 0;
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch {
+    return 0;
+  }
+  try {
+    const row = db
+      .prepare(
+        `WITH RECURSIVE family AS (
+           SELECT id FROM sessions WHERE id = ?
+           UNION ALL
+           SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id = f.id
+         )
+         SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS maxId
+         FROM messages
+         WHERE session_id IN (SELECT id FROM family) AND COALESCE(active, 1) = 1`,
+      )
+      .get(sessionId) as { n: number; maxId: number } | undefined;
+    if (!row || row.n === 0) return 0;
+    // Packed into one number because the gate compares a single REAL. Message ids would have to
+    // pass ~9e9 for this to lose precision, which a local agent's history does not reach.
+    return row.maxId * 1e6 + (row.n % 1e6);
+  } catch {
+    return 0;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -889,6 +927,68 @@ function renderHermesTool(name: string, args: Record<string, unknown>): string |
   return null;
 }
 
+/** One `messages` row of a Hermes session family, as folded by `foldHermesFamily`. */
+export interface HermesRow {
+  session_id: string;
+  role: string;
+  content: string | null;
+  tool_calls: string | null;
+  timestamp: number | null;
+}
+
+/** What makes two rows the *same turn*: who said it and what it said. Deliberately not the
+ *  timestamp — a replayed turn is re-stamped at the moment it was replayed. */
+function hermesTurnKey(row: HermesRow): string {
+  return `${row.role} ${row.content ?? ""} ${row.tool_calls ?? ""}`;
+}
+
+/**
+ * Flatten a session family into one transcript, dropping the copies Hermes keeps of turns that
+ * already happened. Two mechanisms produce those copies, and both were being stored verbatim:
+ *
+ * 1. A continuation/resume session persists a FULL REPLAY of everything it inherited before
+ *    appending its own turns. Unioning a session with its descendants therefore emitted the
+ *    shared prefix once per continuation — a three-deep chain stored the opening turns three
+ *    times. The replay is re-stamped at the fork moment, so it can only be recognised by
+ *    content, and it is not a clean prefix either: Hermes compacts what it carries over, so a
+ *    child's replayed turns end up interleaved with genuinely new ones. A turn an *earlier
+ *    session in the chain* already contributed is therefore dropped wherever it appears, not
+ *    just from a leading run.
+ * 2. Within one session the same row can be persisted twice verbatim after a rewind — same
+ *    timestamp, same body, both `active`. Identical time *and* content is never two real turns.
+ *
+ * Dedup is scoped per session on purpose: repeating a turn *within* one session (running the
+ * same command twice) is real conversation and is kept — only case (2), an exact timestamp
+ * collision, collapses it. Measured over the live Hermes corpus: sessions with continuations
+ * shrink 1049 → 603 stored messages, while sessions without them lose exactly one row.
+ */
+export function foldHermesFamily(familyIds: string[], allRows: HermesRow[]): HermesRow[] {
+  const bySession = new Map<string, HermesRow[]>();
+  for (const row of allRows) {
+    const list = bySession.get(row.session_id);
+    if (list) list.push(row);
+    else bySession.set(row.session_id, [row]);
+  }
+
+  const inherited = new Set<string>();
+  const out: HermesRow[] = [];
+  for (const id of familyIds) {
+    const seenExact = new Set<string>();
+    const own: string[] = [];
+    for (const row of bySession.get(id) ?? []) {
+      const turn = hermesTurnKey(row);
+      own.push(turn);
+      if (inherited.has(turn)) continue;
+      const exact = `${row.timestamp} ${turn}`;
+      if (seenExact.has(exact)) continue;
+      seenExact.add(exact);
+      out.push(row);
+    }
+    for (const turn of own) inherited.add(turn);
+  }
+  return out;
+}
+
 /**
  * Parse one Hermes session (and any child sessions linked via `parent_session_id`) from
  * `state.db`. Tool *outputs* (role=tool) and reasoning columns are dropped; file/shell
@@ -923,37 +1023,39 @@ export async function parseHermesTranscript(refPath: string): Promise<ParsedTran
     const title = typeof session.title === "string" && session.title ? session.title : null;
     const cwd = typeof session.cwd === "string" && session.cwd ? session.cwd : null;
 
-    // Fold one level of descendants (and deeper) under the parent session id.
+    // Fold one level of descendants (and deeper) under the parent session id, oldest branch
+    // first so the original turn always precedes the copies a continuation made of it.
     const familyIds = (
       db
         .prepare(
           `WITH RECURSIVE family AS (
-             SELECT id FROM sessions WHERE id = ?
+             SELECT id, started_at, 0 AS depth FROM sessions WHERE id = ?
              UNION ALL
-             SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id = f.id
+             SELECT s.id, s.started_at, f.depth + 1
+             FROM sessions s JOIN family f ON s.parent_session_id = f.id
            )
-           SELECT id FROM family`,
+           SELECT id FROM family ORDER BY depth ASC, started_at ASC`,
         )
         .all(sessionId) as Array<{ id: string }>
     ).map((r) => r.id);
 
     const placeholders = familyIds.map(() => "?").join(",");
-    const rows = db
+    // Ordered by row id, i.e. the order Hermes persisted them, and grouped per session below.
+    // Sorting the whole family by timestamp instead would interleave the replayed prefixes
+    // described in foldHermesFamily, whose timestamps are the fork moment rather than the
+    // moment the turn happened.
+    const allRows = db
       .prepare(
-        `SELECT role, content, tool_calls, timestamp, active
+        `SELECT session_id, role, content, tool_calls, timestamp
          FROM messages
          WHERE session_id IN (${placeholders})
            AND COALESCE(active, 1) = 1
            AND role IN ('user', 'assistant')
-         ORDER BY timestamp ASC, id ASC`,
+         ORDER BY id ASC`,
       )
-      .all(...familyIds) as Array<{
-      role: string;
-      content: string | null;
-      tool_calls: string | null;
-      timestamp: number | null;
-      active: number | null;
-    }>;
+      .all(...familyIds) as HermesRow[];
+
+    const rows = foldHermesFamily(familyIds, allRows);
 
     const toolEvents: ToolEvent[] = [];
     const userTurns: UserTurn[] = [];

@@ -1,6 +1,4 @@
-import fs from "fs";
-import path from "path";
-import { isPidAlive } from "./pid.js";
+import { isPidLockHeld, readPidLock, tryClaimPidLock } from "./file-lock.js";
 import { resolveClanceyDir, watchLockPath } from "./paths.js";
 
 export interface WatchLock {
@@ -10,68 +8,23 @@ export interface WatchLock {
 
 /**
  * Claim exclusive ownership of the watch indexer.
- * Stale-PID recovery matches Codex live lock behavior.
+ *
+ * `ensureWatchRunning` runs on every MCP client start, and clients start in bursts (one per
+ * editor window), so the recovery path here is genuinely concurrent rather than theoretical.
+ * The read-check-unlink-create sequence this used to do let two racers both conclude the owner
+ * was dead and both end up "owning" the watcher — the second unlink deleting the first's fresh
+ * lock file (CLA-4). `tryClaimPidLock` does the steal with an atomic rename instead.
  */
 export function tryClaimWatchLock(lockFile?: string): WatchLock {
-  const lock = lockFile ?? watchLockPath(resolveClanceyDir());
-  const noop: WatchLock = { owned: false, release: () => {} };
-  fs.mkdirSync(path.dirname(lock), { recursive: true });
-
-  const makeRelease = (): (() => void) => () => {
-    try {
-      const cur = fs.readFileSync(lock, "utf-8").trim();
-      if (cur === String(process.pid)) fs.unlinkSync(lock);
-    } catch {
-      // ignore
-    }
-  };
-
-  const tryCreate = (): boolean => {
-    try {
-      fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  if (tryCreate()) return { owned: true, release: makeRelease() };
-
-  try {
-    const existing = Number(fs.readFileSync(lock, "utf-8").trim());
-    if (!isPidAlive(existing)) {
-      try {
-        fs.unlinkSync(lock);
-      } catch {
-        return noop;
-      }
-      if (tryCreate()) return { owned: true, release: makeRelease() };
-    }
-  } catch {
-    return noop;
-  }
-
-  return noop;
+  return tryClaimPidLock(lockFile ?? watchLockPath(resolveClanceyDir()));
 }
 
 /** True when watch.lock names a live PID. */
 export function isWatchLockHeld(lockFile?: string): boolean {
-  const lock = lockFile ?? watchLockPath(resolveClanceyDir());
-  try {
-    const existing = Number(fs.readFileSync(lock, "utf-8").trim());
-    return isPidAlive(existing);
-  } catch {
-    return false;
-  }
+  return isPidLockHeld(lockFile ?? watchLockPath(resolveClanceyDir()));
 }
 
 /** PID written in the lock file, or null. */
 export function readWatchLockPid(lockFile?: string): number | null {
-  const lock = lockFile ?? watchLockPath(resolveClanceyDir());
-  try {
-    const n = Number(fs.readFileSync(lock, "utf-8").trim());
-    return Number.isInteger(n) && n > 0 ? n : null;
-  } catch {
-    return null;
-  }
+  return readPidLock(lockFile ?? watchLockPath(resolveClanceyDir()));
 }

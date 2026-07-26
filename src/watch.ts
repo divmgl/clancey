@@ -21,7 +21,7 @@ export interface WatchOptions {
   startGraceMs?: number;
   clientCheckMs?: number;
   /** Injected for tests — default runs real backfill. */
-  ingest?: (dbPath: string) => Promise<{ sessions: number }>;
+  ingest?: (dbPath: string, shouldStop?: () => boolean) => Promise<{ sessions: number }>;
   /** Injected sleep for tests. */
   sleep?: (ms: number) => Promise<void>;
   /** Stop after this many loop iterations (tests). */
@@ -46,11 +46,14 @@ function defaultSleep(ms: number): Promise<void> {
  */
 const WATCH_PACE = 0.5;
 
-export async function defaultWatchIngest(dbPath: string): Promise<{ sessions: number }> {
+export async function defaultWatchIngest(
+  dbPath: string,
+  shouldStop?: () => boolean,
+): Promise<{ sessions: number }> {
   if (process.env.CLANCEY_WATCH_DRY === "1") return { sessions: 0 };
   const db = openStore(dbPath);
   try {
-    const stats = await backfill(db, { force: false, pace: WATCH_PACE });
+    const stats = await backfill(db, { force: false, pace: WATCH_PACE, shouldStop });
     maybeCheckpoint(db);
     return { sessions: stats.sessions };
   } finally {
@@ -73,8 +76,8 @@ function maybeCheckpoint(db: ReturnType<typeof openStore>): void {
   if (result === "busy") log("watch checkpoint: busy (readers active), retrying next cycle");
 }
 
-async function defaultIngest(dbPath: string): Promise<{ sessions: number }> {
-  return defaultWatchIngest(dbPath);
+async function defaultIngest(dbPath: string, shouldStop?: () => boolean): Promise<{ sessions: number }> {
+  return defaultWatchIngest(dbPath, shouldStop);
 }
 
 /**
@@ -106,15 +109,20 @@ export async function runWatch(opts: WatchOptions = {}): Promise<"exited-empty" 
   let iterations = 0;
   let lastIngest = 0;
   let stopping = false;
-  const requestStop = (): void => {
+  // `stopping` is polled between loop iterations *and* threaded into the ingest below, because a
+  // single iteration can be a multi-minute scan of the whole corpus. Without the second half the
+  // first signal looked swallowed — and `systemctl stop` / session teardown send exactly one.
+  const requestStop = (signal: string): void => {
+    log(`watch received ${signal}: finishing the current ingest unit, then stopping`);
     stopping = true;
   };
-  process.once("SIGTERM", requestStop);
-  process.once("SIGINT", requestStop);
+  process.once("SIGTERM", () => requestStop("SIGTERM"));
+  process.once("SIGINT", () => requestStop("SIGINT"));
+  const shouldStop = (): boolean => stopping || opts.shouldStop?.() === true;
 
   try {
     while (!stopping) {
-      if (opts.shouldStop?.()) break;
+      if (shouldStop()) break;
       iterations++;
 
       const live = listLiveMcpClients({ dir });
@@ -127,7 +135,7 @@ export async function runWatch(opts: WatchOptions = {}): Promise<"exited-empty" 
       const dueIngest = Date.now() - lastIngest >= pollMs;
       if (dueIngest) {
         try {
-          const stats = await ingest(dbPath);
+          const stats = await ingest(dbPath, shouldStop);
           lastIngest = Date.now();
           if (stats.sessions > 0) log(`watch ingest: ${stats.sessions} session unit(s) updated`);
         } catch (err) {

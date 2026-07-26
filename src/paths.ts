@@ -23,6 +23,11 @@ export function mcpClientsPath(dir: string = resolveClanceyDir()): string {
   return path.join(dir, "mcp-clients.json");
 }
 
+/** Single-owner lock for the MCP auto-refresh backfill, so N clients don't each rescan. */
+export function refreshLockPath(dir: string = resolveClanceyDir()): string {
+  return path.join(dir, "refresh.lock");
+}
+
 export function watchLogPath(dir: string = resolveClanceyDir()): string {
   return path.join(dir, "watch.log");
 }
